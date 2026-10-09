@@ -1,0 +1,666 @@
+import "fake-indexeddb/auto";
+import { test, before, beforeEach, after } from "node:test";
+import assert from "node:assert/strict";
+import { db } from "../src/core/store/database.js";
+import { getPublicKey } from "../src/core/crypto/keys.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+import { detectSystemLocale } from "../src/domain/settings/locale-detection.js";
+import {
+	KIND_UI_SETTINGS,
+	DEFAULT_SETTINGS,
+	buildUiSettingsEvent,
+	parseUiSettingsEvent,
+	loadUiSettings,
+	saveUiSettings,
+	rebuildUiSettings,
+	applyUiSettingsEvents,
+	hasLocalUiSettings,
+	addRelayUrl,
+	removeRelayUrl,
+	setRelayRole,
+	addBlossomUrl,
+	removeBlossomUrl,
+	setActiveBlossomUrl,
+	pairSelfHostedServer,
+	unpairSelfHostedServer,
+	SelfHostedFingerprintMismatchError,
+	markDueDateEverSet,
+} from "../src/domain/settings/ui-settings.js";
+import { parseRelayListEvent } from "../src/domain/identity/relay-list.js";
+import { parseDmRelayListEvent } from "../src/domain/identity/dm-relay-list.js";
+import { DEFAULT_CUSTOM_PALETTE } from "../src/ui/theme/palette-apply.js";
+import { ACCENT_FORBIDDEN_ZONES } from "../src/ui/theme/palette-generator.js";
+import { writeBootstrapEndpoints } from "../src/domain/settings/bootstrap-endpoints.js";
+
+function isHueForbidden(hue) {
+	return ACCENT_FORBIDDEN_ZONES.some((zone) => {
+		const diff = Math.abs(((hue - zone.hue + 540) % 360) - 180);
+		return diff < zone.halfWidth;
+	});
+}
+
+const ALICE_PRIV = new Uint8Array(32).fill(1);
+const ALICE_PUB = bytesToHex(getPublicKey(ALICE_PRIV));
+const DB_KEY = crypto.getRandomValues(new Uint8Array(32));
+
+before(async () => {
+	await db.open();
+});
+
+beforeEach(async () => {
+	await db.table("uiSettings").clear();
+	await db.table("events").clear();
+});
+
+after(() => {
+	db.close();
+});
+
+function capturingPublish(bucket) {
+	return async (event) => {
+		bucket.push(event);
+		return { ok: true };
+	};
+}
+
+function failingPublish() {
+	return async () => {
+		throw new Error("нет соединения");
+	};
+}
+
+test("buildUiSettingsEvent/parseUiSettingsEvent: round-trip, kind 30072, d-tag='settings' буквально", () => {
+	const settings = { ...DEFAULT_SETTINGS, accentColorId: "teal", uiScale: "large" };
+	const event = buildUiSettingsEvent(ALICE_PRIV, settings);
+	assert.equal(event.kind, KIND_UI_SETTINGS);
+	assert.deepEqual(event.tags.find((t) => t[0] === "d"), ["d", "settings"]);
+	const parsed = parseUiSettingsEvent(event, ALICE_PRIV);
+	assert.equal(parsed.accentColorId, "teal");
+	assert.equal(parsed.uiScale, "large");
+});
+
+test("parseUiSettingsEvent: неполный старый payload (без notifications.channels) сливается с дефолтом, не теряя остальное дерево", () => {
+	const oldShape = {
+		accentColorId: "blue",
+		notifications: { enabled: false, contacts: { newRequests: "off", accepted: "sound" } },
+	};
+	const event = buildUiSettingsEvent(ALICE_PRIV, oldShape);
+	const parsed = parseUiSettingsEvent(event, ALICE_PRIV);
+	assert.equal(parsed.notifications.enabled, false, "явно заданное поле сохраняется");
+	assert.equal(parsed.notifications.contacts.newRequests, "off");
+	assert.deepEqual(parsed.notifications.channels, DEFAULT_SETTINGS.notifications.channels, "отсутствовавшая ветка — из дефолта");
+	assert.equal(parsed.uiScale, "medium", "отсутствовавшее верхнеуровневое поле — из дефолта");
+});
+
+test("parseUiSettingsEvent: messages.overrides из старого payload (без channels/moderation вовсе) не теряется, остальные ветки — из дефолта", () => {
+	const oldShape = {
+		notifications: { messages: { default: "popup", overrides: { alice: "off" } } },
+	};
+	const event = buildUiSettingsEvent(ALICE_PRIV, oldShape);
+	const parsed = parseUiSettingsEvent(event, ALICE_PRIV);
+	assert.equal(parsed.notifications.messages.default, "popup");
+	assert.deepEqual(parsed.notifications.messages.overrides, { alice: "off" });
+	assert.deepEqual(parsed.notifications.channels, DEFAULT_SETTINGS.notifications.channels);
+	assert.deepEqual(parsed.notifications.moderation, DEFAULT_SETTINGS.notifications.moderation);
+});
+
+test("loadUiSettings: без локальной записи -> дефолт", async () => {
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.customPalette, null, "совсем новый аккаунт без accentColorId — customPalette не выдумывается, null (build-дефолт применяется на уровне applyCustomPalette, не тут)");
+	assert.equal(settings.uiScale, "medium");
+	assert.deepEqual(settings.notifications, DEFAULT_SETTINGS.notifications);
+});
+
+test("loadUiSettings: нет uiSettings — relay/blossom из bootstrap-endpoints, не молча BUILD_DEFAULT", async () => {
+	const map = new Map();
+	const storage = {
+		getItem(k) {
+			return map.has(k) ? map.get(k) : null;
+		},
+		setItem(k, v) {
+			map.set(k, String(v));
+		},
+		removeItem(k) {
+			map.delete(k);
+		},
+	};
+	const prev = globalThis.localStorage;
+	globalThis.localStorage = storage;
+	try {
+		writeBootstrapEndpoints(
+			{
+				relayUrl: "wss://relay.example:7777",
+				blossomUrl: "https://blossom.example:8080",
+			},
+			storage,
+		);
+		const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+		assert.deepEqual(settings.relayUrls, [{ url: "wss://relay.example:7777", read: true, write: true }]);
+		assert.deepEqual(settings.blossomUrls, ["https://blossom.example:8080"]);
+		assert.equal(settings.activeBlossomUrl, "https://blossom.example:8080");
+	} finally {
+		if (prev === undefined) delete globalThis.localStorage;
+		else globalThis.localStorage = prev;
+	}
+});
+
+// НАЙДЕНО ЖИВЬЁМ (владелец, Э3 native, 2026-09-27) — активный Blossom-сервер,
+// сохранённый в uiSettings ПРИ ПЕРВОМ ЗАПУСКЕ (пока config.json указывал на
+// localhost), застревал там навсегда — правка config.json на реальный адрес
+// острова ничего не меняла для уже существующих личностей. Тот же принцип
+// защиты, что уже есть у readBootstrapEndpoints для relay.
+test("loadUiSettings: сохранённый активный Blossom-сервер — loopback, свежий bootstrap-дефолт настоящий -> подменяется свежим", async () => {
+	const map = new Map();
+	const storage = {
+		getItem(k) {
+			return map.has(k) ? map.get(k) : null;
+		},
+		setItem(k, v) {
+			map.set(k, String(v));
+		},
+		removeItem(k) {
+			map.delete(k);
+		},
+	};
+	const prev = globalThis.localStorage;
+	globalThis.localStorage = storage;
+	try {
+		// Сохранённая запись — как будто личность создана на дев-конфиге.
+		await saveUiSettings(
+			ALICE_PUB,
+			ALICE_PRIV,
+			DB_KEY,
+			{ ...DEFAULT_SETTINGS, blossomUrls: ["http://127.0.0.1:8080"], activeBlossomUrl: "http://127.0.0.1:8080" },
+			failingPublish(),
+		);
+		// config.json теперь указывает на настоящий остров.
+		writeBootstrapEndpoints({ relayUrl: "wss://relay.ugolok.tech", blossomUrl: "https://blossom.ugolok.tech" }, storage);
+		const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+		assert.deepEqual(settings.blossomUrls, ["https://blossom.ugolok.tech"]);
+		assert.equal(settings.activeBlossomUrl, "https://blossom.ugolok.tech");
+	} finally {
+		if (prev === undefined) delete globalThis.localStorage;
+		else globalThis.localStorage = prev;
+	}
+});
+
+test("loadUiSettings: сохранённый Blossom-сервер — настоящий (не loopback) -> НЕ подменяется, даже если bootstrap-дефолт другой", async () => {
+	const map = new Map();
+	const storage = {
+		getItem(k) {
+			return map.has(k) ? map.get(k) : null;
+		},
+		setItem(k, v) {
+			map.set(k, String(v));
+		},
+		removeItem(k) {
+			map.delete(k);
+		},
+	};
+	const prev = globalThis.localStorage;
+	globalThis.localStorage = storage;
+	try {
+		await saveUiSettings(
+			ALICE_PUB,
+			ALICE_PRIV,
+			DB_KEY,
+			{ ...DEFAULT_SETTINGS, blossomUrls: ["https://blossom-a.example"], activeBlossomUrl: "https://blossom-a.example" },
+			failingPublish(),
+		);
+		writeBootstrapEndpoints({ relayUrl: "wss://relay.ugolok.tech", blossomUrl: "https://blossom.ugolok.tech" }, storage);
+		const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+		assert.deepEqual(settings.blossomUrls, ["https://blossom-a.example"], "пользовательский выбор сильнее config.json — так задумано");
+		assert.equal(settings.activeBlossomUrl, "https://blossom-a.example");
+	} finally {
+		if (prev === undefined) delete globalThis.localStorage;
+		else globalThis.localStorage = prev;
+	}
+});
+
+// НАЙДЕНО ЖИВЬЁМ (владелец, Э3 native, 2026-09-27) — тот же баг, что уже
+// найден и исправлен для Blossom выше, только для relay: transport.js's
+// connect() читает relayEntries = localSettings.relayUrls напрямую и падает
+// на bootstrap-дефолт ТОЛЬКО когда список пуст — непустой список из одного
+// loopback-адреса проходит эту проверку. connState повисает на "connecting"
+// навсегда (WebSocket на 127.0.0.1 в нативной оболочке блокируется CSP).
+test("loadUiSettings: сохранённый relay — loopback, свежий bootstrap-дефолт настоящий -> подменяется свежим", async () => {
+	const map = new Map();
+	const storage = {
+		getItem(k) {
+			return map.has(k) ? map.get(k) : null;
+		},
+		setItem(k, v) {
+			map.set(k, String(v));
+		},
+		removeItem(k) {
+			map.delete(k);
+		},
+	};
+	const prev = globalThis.localStorage;
+	globalThis.localStorage = storage;
+	try {
+		await saveUiSettings(
+			ALICE_PUB,
+			ALICE_PRIV,
+			DB_KEY,
+			{ ...DEFAULT_SETTINGS, relayUrls: [{ url: "ws://127.0.0.1:7777", read: true, write: true }] },
+			failingPublish(),
+		);
+		writeBootstrapEndpoints({ relayUrl: "wss://relay.ugolok.tech", blossomUrl: "https://blossom.ugolok.tech" }, storage);
+		const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+		assert.deepEqual(settings.relayUrls, [{ url: "wss://relay.ugolok.tech", read: true, write: true }]);
+	} finally {
+		if (prev === undefined) delete globalThis.localStorage;
+		else globalThis.localStorage = prev;
+	}
+});
+
+test("loadUiSettings: сохранённый relay — настоящий (не loopback) -> НЕ подменяется, даже если bootstrap-дефолт другой", async () => {
+	const map = new Map();
+	const storage = {
+		getItem(k) {
+			return map.has(k) ? map.get(k) : null;
+		},
+		setItem(k, v) {
+			map.set(k, String(v));
+		},
+		removeItem(k) {
+			map.delete(k);
+		},
+	};
+	const prev = globalThis.localStorage;
+	globalThis.localStorage = storage;
+	try {
+		await saveUiSettings(
+			ALICE_PUB,
+			ALICE_PRIV,
+			DB_KEY,
+			{ ...DEFAULT_SETTINGS, relayUrls: [{ url: "wss://relay-a.example", read: true, write: true }] },
+			failingPublish(),
+		);
+		writeBootstrapEndpoints({ relayUrl: "wss://relay.ugolok.tech", blossomUrl: "https://blossom.ugolok.tech" }, storage);
+		const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+		assert.deepEqual(settings.relayUrls, [{ url: "wss://relay-a.example", read: true, write: true }], "пользовательский выбор сильнее config.json — так задумано");
+	} finally {
+		if (prev === undefined) delete globalThis.localStorage;
+		else globalThis.localStorage = prev;
+	}
+});
+
+// Этап 70 — миграция старого accentColorId (14 именованных пресетов, удалены
+// вместе с accent-palette.js) в customPalette: {cNeutral, accentHue} нового
+// генератора палитры. Часть пресетов (sky/terracotta/amber/saffron/moss)
+// попадает в запретные зоны служебных тонов — должны быть сдвинуты к
+// ближайшему разрешённому краю зоны, не отвергнуты и не оставлены как есть.
+test("mergeWithDefaults (через parseUiSettingsEvent): старый accentColorId без customPalette -> мигрирует в customPalette с тем же hue, если он разрешён", () => {
+	const event = buildUiSettingsEvent(ALICE_PRIV, { accentColorId: "teal" }); // teal hue=185, вне запретных зон
+	const parsed = parseUiSettingsEvent(event, ALICE_PRIV);
+	assert.ok(parsed.customPalette, "customPalette должен появиться из миграции");
+	assert.equal(parsed.customPalette.accentHue, 185);
+	assert.equal(parsed.customPalette.cNeutral, DEFAULT_CUSTOM_PALETTE.cNeutral, "cNeutral берётся из build-дефолта — старая система его не знала");
+});
+
+test("миграция accentColorId: коллизия с запретной зоной сдвигает hue к ближайшему краю, не отвергает и не оставляет исходный hue", () => {
+	// sky=230 -> зона info 235±20 = [215,255]; ближайший край 215 (|230-215|=15 < |230-255|=25)
+	const event = buildUiSettingsEvent(ALICE_PRIV, { accentColorId: "sky" });
+	const parsed = parseUiSettingsEvent(event, ALICE_PRIV);
+	assert.ok(parsed.customPalette);
+	assert.equal(parsed.customPalette.accentHue, 215);
+	assert.equal(isHueForbidden(parsed.customPalette.accentHue), false, "мигрированный hue сам не должен попадать в запретную зону");
+});
+
+test("миграция accentColorId: ВСЕ 14 легаси-пресетов после миграции дают разрешённый hue (не только 5 известных коллизий)", () => {
+	const LEGACY_IDS = ["blue", "indigo", "sky", "teal", "cyan", "lavender", "violet", "terracotta", "amber", "peach", "saffron", "orange", "olive", "moss"];
+	for (const id of LEGACY_IDS) {
+		const event = buildUiSettingsEvent(ALICE_PRIV, { accentColorId: id });
+		const parsed = parseUiSettingsEvent(event, ALICE_PRIV);
+		assert.ok(parsed.customPalette, `${id}: customPalette должен появиться`);
+		assert.equal(isHueForbidden(parsed.customPalette.accentHue), false, `${id}: мигрированный hue ${parsed.customPalette.accentHue} не должен быть в запретной зоне`);
+	}
+});
+
+test("миграция accentColorId: hue ровно в центре запретной зоны (saffron=85, центр warn 85±20) — сдвигается на один из краёв, не оставляет 85", () => {
+	const event = buildUiSettingsEvent(ALICE_PRIV, { accentColorId: "saffron" });
+	const parsed = parseUiSettingsEvent(event, ALICE_PRIV);
+	assert.ok([65, 105].includes(parsed.customPalette.accentHue), `ожидался край зоны 65 или 105, получено ${parsed.customPalette.accentHue}`);
+});
+
+test("миграция accentColorId: уже выставленный customPalette не перезаписывается миграцией", () => {
+	const explicit = { cNeutral: 0.01, accentHue: 300 };
+	const event = buildUiSettingsEvent(ALICE_PRIV, { accentColorId: "blue", customPalette: explicit });
+	const parsed = parseUiSettingsEvent(event, ALICE_PRIV);
+	assert.deepEqual(parsed.customPalette, explicit, "явный выбор пользователя приоритетнее миграции из устаревшего поля");
+});
+
+test("миграция accentColorId: неизвестный/битый accentColorId не мигрирует и не падает — customPalette остаётся null", () => {
+	const event = buildUiSettingsEvent(ALICE_PRIV, { accentColorId: "какой-то-мусор-не-из-таблицы" });
+	const parsed = parseUiSettingsEvent(event, ALICE_PRIV);
+	assert.equal(parsed.customPalette, null);
+});
+
+// Этап 64 — первый запуск определяет язык системным языком (detectSystemLocale),
+// не жёстко зашитым DEFAULT_SETTINGS.language="ru". Node сам предоставляет
+// глобальный navigator.language (окружение среды выполнения) — сравниваем с
+// detectSystemLocale() напрямую, а не с зашитым в тест кодом.
+test("loadUiSettings: без локальной записи -> язык через detectSystemLocale, не жёсткий 'ru'", async () => {
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.language, detectSystemLocale());
+});
+
+// Этап 61 — hasLocalUiSettings: loadUiSettings сама неотличима снаружи (фолбэк
+// смёрджен с дефолтом так же, как настоящая запись) — нужна прямая проверка.
+test("hasLocalUiSettings: false, пока не было ни одного saveUiSettings", async () => {
+	assert.equal(await hasLocalUiSettings(ALICE_PUB), false);
+});
+
+test("hasLocalUiSettings: true сразу после первого saveUiSettings", async () => {
+	await saveUiSettings(ALICE_PUB, ALICE_PRIV, DB_KEY, DEFAULT_SETTINGS, failingPublish());
+	assert.equal(await hasLocalUiSettings(ALICE_PUB), true);
+});
+
+test("hasLocalUiSettings: не путает разных владельцев", async () => {
+	const BOB_PRIV = new Uint8Array(32).fill(2);
+	const BOB_PUB = bytesToHex(getPublicKey(BOB_PRIV));
+	await saveUiSettings(ALICE_PUB, ALICE_PRIV, DB_KEY, DEFAULT_SETTINGS, failingPublish());
+	assert.equal(await hasLocalUiSettings(BOB_PUB), false);
+});
+
+test("saveUiSettings: сохраняет локально СРАЗУ, даже если publish бросает ошибку (best-effort)", async () => {
+	const settings = { ...DEFAULT_SETTINGS, accentColorId: "violet" };
+	await saveUiSettings(ALICE_PUB, ALICE_PRIV, DB_KEY, settings, failingPublish());
+	const loaded = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(loaded.accentColorId, "violet", "локальное сохранение не зависит от результата публикации");
+});
+
+test("addRelayUrl/setRelayRole/removeRelayUrl: полный цикл (этап 58 — {url,read,write}, не одно активное)", async () => {
+	const published = [];
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", capturingPublish(published));
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-b.example", capturingPublish(published));
+	let settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.deepEqual(settings.relayUrls, [
+		{ url: "wss://relay-a.example", read: true, write: true },
+		{ url: "wss://relay-b.example", read: true, write: true },
+	]);
+
+	await setRelayRole(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-b.example", { read: true, write: false }, capturingPublish(published));
+	settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.deepEqual(
+		settings.relayUrls.find((r) => r.url === "wss://relay-b.example"),
+		{ url: "wss://relay-b.example", read: true, write: false },
+	);
+	// relay-a остаётся read+write — иначе следующий шаг (снятие read+write с b) не нарушил бы
+	// инвариант "хотя бы один write" сам по себе, но проверяем именно точечную правку одной записи
+	assert.deepEqual(
+		settings.relayUrls.find((r) => r.url === "wss://relay-a.example"),
+		{ url: "wss://relay-a.example", read: true, write: true },
+	);
+
+	await removeRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", capturingPublish(published));
+	settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.deepEqual(settings.relayUrls, [{ url: "wss://relay-b.example", read: true, write: false }]);
+
+	await assert.rejects(
+		() => removeRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-b.example", capturingPublish(published)),
+		/последн/i,
+		"нельзя удалить последний relay — список не должен опустеть",
+	);
+});
+
+test("addRelayUrl: повторное добавление того же URL идемпотентно (не дублирует)", async () => {
+	const published = [];
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", capturingPublish(published));
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", capturingPublish(published));
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.deepEqual(settings.relayUrls, [{ url: "wss://relay-a.example", read: true, write: true }]);
+});
+
+test("setRelayRole: URL, которого нет в списке -> throw", async () => {
+	await assert.rejects(
+		() => setRelayRole(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://unknown.example", { read: true, write: true }, capturingPublish([])),
+		/отсутствует/,
+	);
+});
+
+test("setRelayRole: нельзя оставить список без единого read:true", async () => {
+	const published = [];
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://only.example", capturingPublish(published));
+	await assert.rejects(
+		() => setRelayRole(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://only.example", { read: false, write: true }, capturingPublish(published)),
+		/read/,
+	);
+});
+
+test("setRelayRole: нельзя оставить список без единого write:true", async () => {
+	const published = [];
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://only.example", capturingPublish(published));
+	await assert.rejects(
+		() => setRelayRole(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://only.example", { read: true, write: false }, capturingPublish(published)),
+		/write/,
+	);
+});
+
+// Этап 59 — addRelayUrl/removeRelayUrl/setRelayRole дополнительно публикуют
+// РЕАЛЬНЫЙ kind:10002 (NIP-65), отражающий список ПОСЛЕ применения мутации.
+test("addRelayUrl: публикует kind:10002 с полным текущим списком relay", async () => {
+	const published = [];
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", capturingPublish(published));
+	const relayListEvents = published.filter((e) => e.kind === 10002);
+	assert.equal(relayListEvents.length, 1);
+	assert.deepEqual(parseRelayListEvent(relayListEvents[0]), [{ url: "wss://relay-a.example", read: true, write: true }]);
+
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-b.example", capturingPublish(published));
+	const secondRelayListEvent = published.filter((e) => e.kind === 10002).at(-1);
+	assert.deepEqual(parseRelayListEvent(secondRelayListEvent), [
+		{ url: "wss://relay-a.example", read: true, write: true },
+		{ url: "wss://relay-b.example", read: true, write: true },
+	]);
+});
+
+test("setRelayRole: опубликованный kind:10002 отражает НОВУЮ роль (read/write маркер)", async () => {
+	const published = [];
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", capturingPublish(published));
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-b.example", capturingPublish(published));
+	await setRelayRole(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", { read: true, write: false }, capturingPublish(published));
+	const lastRelayListEvent = published.filter((e) => e.kind === 10002).at(-1);
+	assert.deepEqual(parseRelayListEvent(lastRelayListEvent), [
+		{ url: "wss://relay-a.example", read: true, write: false },
+		{ url: "wss://relay-b.example", read: true, write: true },
+	]);
+});
+
+test("removeRelayUrl: опубликованный kind:10002 не содержит удалённый relay", async () => {
+	const published = [];
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", capturingPublish(published));
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-b.example", capturingPublish(published));
+	await removeRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", capturingPublish(published));
+	const lastRelayListEvent = published.filter((e) => e.kind === 10002).at(-1);
+	assert.deepEqual(parseRelayListEvent(lastRelayListEvent), [{ url: "wss://relay-b.example", read: true, write: true }]);
+});
+
+// Этап 60 — рядом с kind:10002 та же мутация публикует kind:10050 (NIP-17),
+// но только read-relay (write-only исключаются — "сюда мне присылайте" имеет
+// смысл лишь для того, что реально слушается).
+test("addRelayUrl/setRelayRole: публикует kind:10050 только с read-relay", async () => {
+	const published = [];
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", capturingPublish(published));
+	await addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-b.example", capturingPublish(published));
+	let lastDmRelayEvent = published.filter((e) => e.kind === 10050).at(-1);
+	assert.deepEqual(parseDmRelayListEvent(lastDmRelayEvent), ["wss://relay-a.example", "wss://relay-b.example"]);
+
+	await setRelayRole(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-b.example", { read: false, write: true }, capturingPublish(published));
+	lastDmRelayEvent = published.filter((e) => e.kind === 10050).at(-1);
+	assert.deepEqual(parseDmRelayListEvent(lastDmRelayEvent), ["wss://relay-a.example"], "write-only relay исключён из kind:10050");
+});
+
+test("addRelayUrl: сбой publish (нет сети) не бросает наружу — kind:10002 best-effort, как и kind 30072", async () => {
+	await assert.doesNotReject(() => addRelayUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "wss://relay-a.example", failingPublish()));
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.deepEqual(settings.relayUrls, [{ url: "wss://relay-a.example", read: true, write: true }], "локальное сохранение не зависит от результата публикации");
+});
+
+test("addBlossomUrl/setActiveBlossomUrl/removeBlossomUrl: тот же цикл, что relay", async () => {
+	const published = [];
+	await addBlossomUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "https://blossom-a.example", capturingPublish(published));
+	await setActiveBlossomUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "https://blossom-a.example", capturingPublish(published));
+	await assert.rejects(() => removeBlossomUrl(ALICE_PUB, ALICE_PRIV, DB_KEY, "https://blossom-a.example", capturingPublish(published)), /активный/);
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.activeBlossomUrl, "https://blossom-a.example");
+});
+
+test("rebuildUiSettings: сканирует events, берёт ПОСЛЕДНИЙ по created_at, сохраняет локально", async () => {
+	const older = buildUiSettingsEvent(ALICE_PRIV, { ...DEFAULT_SETTINGS, accentColorId: "sky" }, 1000);
+	const newer = buildUiSettingsEvent(ALICE_PRIV, { ...DEFAULT_SETTINGS, accentColorId: "moss" }, 2000);
+	await db.table("events").bulkAdd([
+		{ id: older.id, pubkey: ALICE_PUB, kind: KIND_UI_SETTINGS, created_at: older.created_at, tags: older.tags, content: older.content, sig: older.sig },
+		{ id: newer.id, pubkey: ALICE_PUB, kind: KIND_UI_SETTINGS, created_at: newer.created_at, tags: newer.tags, content: newer.content, sig: newer.sig },
+	]);
+	await rebuildUiSettings(ALICE_PUB, ALICE_PRIV, DB_KEY);
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.accentColorId, "moss", "последняя по created_at версия выигрывает (LWW)");
+});
+
+// Этап 71-довесок (transport.js, ТЗ-NATIVE-APPS §6.3) — rebuildUiSettings сама
+// теперь только читает ЛОКАЛЬНЫЙ кэш events; когда connect() не уверен, что
+// bootstrap успел его наполнить, он делает отдельный прицельный запрос к relay
+// и применяет результат ЭТОЙ функцией напрямую, минуя таблицу events. Здесь
+// проверяем именно её — не зависит от того, что лежит в db.table("events").
+test("applyUiSettingsEvents: применяет напрямую переданные события (не читает db.table events) -> true", async () => {
+	const event = buildUiSettingsEvent(ALICE_PRIV, { ...DEFAULT_SETTINGS, accentColorId: "amber" }, 1000);
+	const applied = await applyUiSettingsEvents(ALICE_PUB, ALICE_PRIV, DB_KEY, [event]);
+	assert.equal(applied, true);
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.accentColorId, "amber");
+});
+
+test("applyUiSettingsEvents: пустой список -> false, не трогает уже сохранённое", async () => {
+	await saveUiSettings(ALICE_PUB, ALICE_PRIV, DB_KEY, { ...DEFAULT_SETTINGS, accentColorId: "teal" }, async () => ({ ok: true }));
+	const applied = await applyUiSettingsEvents(ALICE_PUB, ALICE_PRIV, DB_KEY, []);
+	assert.equal(applied, false);
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.accentColorId, "teal", "пустой список — no-op, не откатывает уже сохранённое");
+});
+
+test("applyUiSettingsEvents: несколько версий -> берёт ПОСЛЕДНЮЮ по created_at (LWW), тот же приём, что rebuildUiSettings", async () => {
+	const older = buildUiSettingsEvent(ALICE_PRIV, { ...DEFAULT_SETTINGS, accentColorId: "sky" }, 1000);
+	const newer = buildUiSettingsEvent(ALICE_PRIV, { ...DEFAULT_SETTINGS, accentColorId: "moss" }, 2000);
+	await applyUiSettingsEvents(ALICE_PUB, ALICE_PRIV, DB_KEY, [older, newer]);
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.accentColorId, "moss");
+});
+
+test("rebuildUiSettings: нет событий -> no-op, не бросает", async () => {
+	await rebuildUiSettings(ALICE_PUB, ALICE_PRIV, DB_KEY);
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.customPalette, null, "остаётся дефолт");
+});
+
+// AC-16, Tier 4 (этап 45) — сырой дамп таблицы не должен содержать relay/Blossom
+// URL в открытом виде; только ownerPubkey остаётся plaintext (индекс).
+test("AC-16: сырая запись uiSettings в IndexedDB не содержит relayUrls/blossomUrls в открытом виде", async () => {
+	await saveUiSettings(
+		ALICE_PUB,
+		ALICE_PRIV,
+		DB_KEY,
+		{ ...DEFAULT_SETTINGS, relayUrls: [{ url: "wss://secret-relay.example", read: true, write: true }] },
+		capturingPublish([]),
+	);
+	const row = await db.table("uiSettings").get(ALICE_PUB);
+	assert.equal(row.ownerPubkey, ALICE_PUB);
+	assert.equal(row.relayUrls, undefined, "поля настроек не должны лежать top-level в открытом виде");
+	const dump = JSON.stringify(row);
+	assert.ok(!dump.includes("secret-relay"), "URL не должен встречаться нигде в сырой записи");
+	assert.ok(row.nonce && row.ciphertext, "содержимое должно быть зашифровано в nonce/ciphertext");
+});
+
+test("неверный dbKey -> loadUiSettings бросает (AES-GCM/ChaCha tag mismatch), не молча возвращает мусор", async () => {
+	await saveUiSettings(ALICE_PUB, ALICE_PRIV, DB_KEY, { ...DEFAULT_SETTINGS, accentColorId: "violet" }, capturingPublish([]));
+	const wrongKey = crypto.getRandomValues(new Uint8Array(32));
+	await assert.rejects(() => loadUiSettings(ALICE_PUB, wrongKey));
+});
+
+// Этап 63, И3 — сопряжение с self-hosted сервером, TOFU-проверка отпечатка.
+const SAMPLE_PAIRING = { host: "203.0.113.42", port: 8443, token: "deadbeef", fingerprint: "cafe0001" };
+
+test("pairSelfHostedServer: сохраняет пейринг + pairedAt (unix-секунды)", async () => {
+	const before = Math.floor(Date.now() / 1000);
+	await pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, SAMPLE_PAIRING, capturingPublish([]));
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.selfHostedServer.host, SAMPLE_PAIRING.host);
+	assert.equal(settings.selfHostedServer.port, SAMPLE_PAIRING.port);
+	assert.equal(settings.selfHostedServer.token, SAMPLE_PAIRING.token);
+	assert.equal(settings.selfHostedServer.fingerprint, SAMPLE_PAIRING.fingerprint);
+	assert.ok(settings.selfHostedServer.pairedAt >= before);
+});
+
+test("pairSelfHostedServer: НЕТ предыдущего сопряжения -> просто сохраняет, без TOFU-конфликта", async () => {
+	await assert.doesNotReject(() => pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, SAMPLE_PAIRING, capturingPublish([])));
+});
+
+test("pairSelfHostedServer: тот же host:port, ТОТ ЖЕ отпечаток -> не конфликт (переподключение/обновление токена)", async () => {
+	await pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, SAMPLE_PAIRING, capturingPublish([]));
+	const updated = { ...SAMPLE_PAIRING, token: "newtoken" };
+	await assert.doesNotReject(() => pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, updated, capturingPublish([])));
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.selfHostedServer.token, "newtoken");
+});
+
+test("pairSelfHostedServer: тот же host:port, ДРУГОЙ отпечаток -> SelfHostedFingerprintMismatchError, не сохраняет молча", async () => {
+	await pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, SAMPLE_PAIRING, capturingPublish([]));
+	const differentFingerprint = { ...SAMPLE_PAIRING, fingerprint: "differentfp" };
+	await assert.rejects(
+		() => pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, differentFingerprint, capturingPublish([])),
+		SelfHostedFingerprintMismatchError,
+	);
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.selfHostedServer.fingerprint, SAMPLE_PAIRING.fingerprint, "старое сопряжение не должно быть перезаписано без force");
+});
+
+test("pairSelfHostedServer: другой отпечаток, НО force:true -> перезаписывает (пользователь подтвердил)", async () => {
+	await pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, SAMPLE_PAIRING, capturingPublish([]));
+	const differentFingerprint = { ...SAMPLE_PAIRING, fingerprint: "differentfp" };
+	await assert.doesNotReject(() =>
+		pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, differentFingerprint, capturingPublish([]), { force: true }),
+	);
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.selfHostedServer.fingerprint, "differentfp");
+});
+
+test("pairSelfHostedServer: другой host (тот же порт) -> не конфликт, TOFU привязан к host:port вместе", async () => {
+	await pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, SAMPLE_PAIRING, capturingPublish([]));
+	const differentHost = { ...SAMPLE_PAIRING, host: "203.0.113.99", fingerprint: "totallydifferent" };
+	await assert.doesNotReject(() => pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, differentHost, capturingPublish([])));
+});
+
+test("unpairSelfHostedServer: сбрасывает в null", async () => {
+	await pairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, SAMPLE_PAIRING, capturingPublish([]));
+	await unpairSelfHostedServer(ALICE_PUB, ALICE_PRIV, DB_KEY, capturingPublish([]));
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.selfHostedServer, null);
+});
+
+test("DEFAULT_SETTINGS.selfHostedServer — null по умолчанию (старые записи без этого поля не ломаются)", async () => {
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.selfHostedServer, null);
+});
+
+// Редизайн интерфейса, этап 4 (CONTRACTS.md) — markDueDateEverSet
+
+test("DEFAULT_SETTINGS.everSetDueDate — false по умолчанию", async () => {
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.everSetDueDate, false);
+});
+
+test("markDueDateEverSet: первый вызов сохраняет true и публикует", async () => {
+	const published = [];
+	await markDueDateEverSet(ALICE_PUB, ALICE_PRIV, DB_KEY, capturingPublish(published));
+	const settings = await loadUiSettings(ALICE_PUB, DB_KEY);
+	assert.equal(settings.everSetDueDate, true);
+	assert.equal(published.length, 1);
+});
+
+test("markDueDateEverSet: идемпотентно — второй вызов не публикует повторно", async () => {
+	const published = [];
+	await markDueDateEverSet(ALICE_PUB, ALICE_PRIV, DB_KEY, capturingPublish(published));
+	await markDueDateEverSet(ALICE_PUB, ALICE_PRIV, DB_KEY, capturingPublish(published));
+	assert.equal(published.length, 1, "второй вызов не должен был опубликовать событие снова");
+});

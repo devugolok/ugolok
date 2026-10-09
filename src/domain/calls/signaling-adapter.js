@@ -1,0 +1,97 @@
+// Этап 48, п.4 (VOICE.md §3) — Nostr in/out для сигналинга звонка. Написан Claude
+// напрямую (короткий, тесно завязан на уже принятое решение по шифрованию —
+// CONTRACTS.md "Этап 48": kind 20075 эфемерный, NIP-44 напрямую, без gift-wrap).
+
+import { encrypt as nip44Encrypt, decrypt as nip44Decrypt } from "../../core/crypto/nip44.js";
+import { sign } from "../../core/crypto/sign.js";
+
+export const CALL_SIGNAL_KIND = 20075;
+
+// Один kind на ВСЕ типы сигнальных сообщений — тип различается полем payload.type
+// (тот же приём, что d-tag-подтипы/маркеры уже применяются в проекте), не плодим
+// kind на каждый вариант.
+//
+// hTopic (Rooms, этап 4, ROOMS-SPEC §5.3) — необязательный: обычные 1:1-звонки его
+// не передают (тег отсутствует, поведение не меняется); mesh-supervisor.js передаёт
+// hTopic комнаты, событие получает ВТОРОЙ тег ["h", hTopic] — им ловит подписка
+// room-transport.js, шифрование НЕ меняется (по-прежнему NIP-44 попарно, §5.3
+// решение: не заводить симметричный режим на kSess — сигналинг паренный по природе).
+export function buildCallSignalEvent(privKey, peerPubkey, payload, createdAt = Math.floor(Date.now() / 1000), hTopic) {
+	const plaintext = JSON.stringify(payload);
+	const content = nip44Encrypt(plaintext, privKey, peerPubkey);
+	const tags = hTopic ? [["p", peerPubkey], ["h", hTopic]] : [["p", peerPubkey]];
+	const eventTemplate = { kind: CALL_SIGNAL_KIND, tags, content, created_at: createdAt };
+	return sign(eventTemplate, privKey);
+}
+
+export function parseCallSignalEvent(event, privKey) {
+	const plaintext = nip44Decrypt(event.content, privKey, event.pubkey);
+	return JSON.parse(plaintext);
+}
+
+// execute(command, ctx) — SEND_* команды (§1.4 VOICE.md) -> публикация kind 20075.
+// Остальные команды (медиа/таймеры/EMIT) сюда не приходят — call-runtime.js их
+// не пересылает (тот же принцип, что media-controller.js).
+export async function execute(command, ctx) {
+	const { privKey, peerPubkey, sessionId, publish, hTopic } = ctx;
+	let payload;
+	switch (command.type) {
+		case "SEND_OFFER":
+			payload = { type: "offer", sessionId, sdp: command.sdp };
+			if (command.restart) payload.restart = true;
+			break;
+		case "SEND_ANSWER":
+			payload = { type: "answer", sessionId, sdp: command.sdp };
+			break;
+		case "SEND_ICE":
+			payload = { type: "ice", sessionId, candidate: command.candidate };
+			break;
+		case "SEND_HANGUP":
+			payload = { type: "hangup", sessionId };
+			break;
+		// TZ-recovery-policy.md §3 — признак жизни звонка, раз в CALL_HEARTBEAT_MS
+		// пока CONNECTED/RECONNECTING. Тот же kind 20075, обычный payload.type —
+		// ничего нового в контракте relay/шифровании (задание §0.2: не менять
+		// транспорт Nostr).
+		case "SEND_HEARTBEAT":
+			payload = { type: "heartbeat", sessionId };
+			break;
+		default:
+			return undefined;
+	}
+	if (typeof command.seq === "number") payload.seq = command.seq;
+	const event = buildCallSignalEvent(privKey, peerPubkey, payload, undefined, hTopic);
+	// TZ-diag-trace.md §2.4 — eventId примешивается к результату publish() ниже
+	// ТОЛЬКО ради трассировки (call-runtime.js её читает и пишет в запись, если
+	// onTrace передан); ни само условие, ни обработка ошибки не меняются —
+	// publish(event) исполняется и await'ится ровно как раньше, отказ (throw)
+	// пробрасывается наружу без изменений. Раньше здесь возвращался сам
+	// publish(event) без ожидания — теперь функция await'ит его и возвращает
+	// { ...результат publish(), eventId } — call-runtime.js этот результат
+	// прежде НЕ читал (return publish(command...) отбрасывался), так что для
+	// логики звонка это не наблюдаемое изменение.
+	const result = await publish(event);
+	return { ...result, eventId: event.id };
+}
+
+// toFsmEvent(payload, senderPubkey, myPubkey) — расшифрованный payload (после
+// parseCallSignalEvent) -> событие Σ_in (§1.3-B VOICE.md) для reduce(). myPubkey
+// нужен ТОЛЬКО для offer'а (может создать НОВУЮ сессию — IDLE->INCOMING_RINGING,
+// или прийти как glare — в обоих случаях reduce вычисляет/сверяет polite через
+// myPubkey, см. CONTRACTS.md "Этап 48", пробел про myPubkey в state).
+export function toFsmEvent(payload, senderPubkey, myPubkey) {
+	switch (payload.type) {
+		case "offer":
+			return { type: "REMOTE_OFFER", sdp: payload.sdp, sessionId: payload.sessionId, fromPubkey: senderPubkey, myPubkey, restart: payload.restart === true };
+		case "answer":
+			return { type: "REMOTE_ANSWER", sdp: payload.sdp, sessionId: payload.sessionId };
+		case "ice":
+			return { type: "REMOTE_ICE", candidate: payload.candidate, sessionId: payload.sessionId };
+		case "hangup":
+			return { type: "REMOTE_HANGUP", sessionId: payload.sessionId };
+		case "heartbeat":
+			return { type: "REMOTE_HEARTBEAT", sessionId: payload.sessionId };
+		default:
+			return null;
+	}
+}

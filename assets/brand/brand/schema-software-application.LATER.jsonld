@@ -1,0 +1,13 @@
+{
+  "_comment": "НЕ ВСТАВЛЯТЬ, пока нет настоящих отзывов. Google для SoftwareApplication требует aggregateRating или review и без них показывает ошибку в Search Console. Выдуманный рейтинг — нарушение правил и риск ручных санкций. Когда появятся реальные отзывы, добавь этот объект в @graph в head.html.",
+  "@type": "SoftwareApplication",
+  "@id": "https://ugolok.tech/#app",
+  "name": "Уголок",
+  "applicationCategory": "CommunicationApplication",
+  "operatingSystem": "Web",
+  "url": "https://ugolok.tech/",
+  "image": "https://ugolok.tech/web-app-manifest-512x512.png",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "RUB" },
+  "featureList": "Личные чаты со сквозным шифрованием; каналы и посты; зашифрованное хранилище файлов; голосовые звонки; комнаты «Быстрая связь»; собственный сервер",
+  "publisher": { "@id": "https://ugolok.tech/#org" }
+}

@@ -1,0 +1,1118 @@
+import { useState, useEffect, useRef } from "preact/hooks";
+import { shortPubkey } from "../format.js";
+import { currentUser, privKeySig, dbKeySig } from "../signals/auth.js";
+import { notifyConnectionTrouble } from "../signals/connection-notice.js";
+import {
+	ensureConnected,
+	publish,
+	publishToContact,
+	fetchProfiles,
+	fetchDeviceKeyPackages,
+	refreshGroupMessageSubscription,
+	refreshLiveProfileSubscription,
+	nextLamportTick,
+} from "../signals/transport.js";
+import { place, openChat, goTo, getChatBackTo } from "../signals/place.js";
+import { contacts, profiles, refreshAll, refreshProfiles } from "../signals/contacts.js";
+import { placeCall } from "../signals/call.js";
+import IconPhoneCall from "../icons/phone-call.jsx";
+import IconSend from "../icons/send.jsx";
+import IconEraser from "../icons/eraser.jsx";
+import IconPencil from "../icons/pencil.jsx";
+import IconTrash from "../icons/trash.jsx";
+import DeleteChatDialog from "../components/delete-chat-dialog.jsx";
+import IconArrowLeft from "../icons/arrow-left.jsx";
+import { ContactIdentity } from "./contacts.jsx";
+import { record as traceDelivery } from "../../core/diag/delivery-trace.js";
+import {
+	messagingActivity,
+	listChatPartners,
+	sendChatMessageAction,
+	deleteChatMessageAction,
+	deleteMessageForMeAction,
+	clearChatHistoryAction,
+	deleteChatForeverAction,
+	editChatMessageAction,
+	reactChatMessageAction,
+	markChatReadAction,
+	saveChatDraftAction,
+	resendChatOpenRequestAction,
+} from "../signals/chats.js";
+import { refreshInboxRequests, acceptInboxRequestAction, rejectInboxRequestAction } from "../signals/inbox.js";
+import { loadChatWindow, markWindowLoaded } from "../../core/sync/lazy-chat.js";
+import { getDraft } from "../../domain/messaging/drafts.js";
+import { getUnreadCount } from "../../domain/messaging/read-status.js";
+import { listConversations } from "../../domain/messaging/chat-activity.js";
+import { refreshUnreadMessagesCount } from "../signals/notifications.js";
+import { MAX_ATTACHMENTS_PER_MESSAGE } from "../../domain/files/attachment-validation.js";
+import MessageBubble from "../components/message-bubble.jsx";
+import AttachmentTray from "../components/media/attachment-tray.jsx";
+import { useAttachmentTray } from "../hooks/use-attachment-tray.js";
+import { useVoiceRecording } from "../hooks/use-voice-recording.js";
+import { ComposeAttachButtons, VoiceRecordingStatus } from "../components/compose-attach-tools.jsx";
+import ActionsMenu from "../components/actions-menu.jsx";
+import Screen from "../components/screen.jsx";
+import { openMedia } from "../signals/media.js";
+import { collectChatScope, findRefPosition } from "../../domain/media/scope.js";
+import { classOf, refFromAttachment } from "../../domain/media/media-ref.js";
+import AttachmentSlices from "../components/media/attachment-slices.jsx";
+import AccountAvatar from "../components/account-avatar.jsx";
+import IconMagnifyingGlass from "../icons/magnifying-glass.jsx";
+import { t, errorMessage, currentLocale } from "../signals/i18n.js";
+import { formatLastSeen } from "../format-last-seen.js";
+import { getPeerLastSeenAt, clampLastSeenAt } from "../../domain/messaging/peer-presence.js";
+import { getPeerCursor, flushCursorNow } from "../../domain/messaging/peer-cursors.js";
+import { armPeerCursorAck } from "../../domain/messaging/chat.js";
+import SelectionFormatBar from "../components/selection-format-bar.jsx";
+import EmojiGlyph from "../components/emoji-glyph.jsx";
+import QuoteSelectionButton from "../components/quote-selection-button.jsx";
+import IconCornerBack from "../icons/corner-back.jsx";
+import IconCross from "../icons/cross.jsx";
+import { buildReplyTo } from "../../domain/messaging/reply.js";
+import { parseStickerKey } from "../../domain/content/sticker.js";
+import FavStar from "../components/fav-star.jsx";
+import { isComposeSubmitKey } from "../hooks/compose-submit-key.js";
+
+const MAX_MESSAGE_LENGTH = 10000; // F-MS-08
+
+// contacts.jsx уже вызывает ensureConnected при заходе на вкладку "Контакты" — но
+// пользователь может открыть "Сообщения" напрямую, минуя её. ensureConnected идемпотентна
+// (singleton-соединение на вкладку), повторный вызов отсюда безопасен.
+// Подпись времени в строке списка: сегодня — часы:минуты, до недели назад — день
+// недели, дальше — дата. Локаль — текущая локаль интерфейса.
+function formatRowTime(ms) {
+	const now = new Date();
+	const d = new Date(ms);
+	const startOfDay = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+	const days = Math.round((startOfDay(now) - startOfDay(d)) / 86400000);
+	const locale = currentLocale.value;
+	if (days <= 0) return d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+	if (days < 7) return d.toLocaleDateString(locale, { weekday: "short" });
+	return d.toLocaleDateString(locale, { day: "numeric", month: "short" });
+}
+
+function ChatList({ ownerPubkey, privKey, dbKey, onCompose }) {
+	const [chatPartners, setChatPartners] = useState([]);
+	const [inboxList, setInboxList] = useState([]);
+	const [unreadByPartner, setUnreadByPartner] = useState({});
+	const [lastAtByPartner, setLastAtByPartner] = useState({});
+	const [listError, setListError] = useState("");
+	const [busy, setBusy] = useState(false);
+	const busyRef = useRef(false);
+	// Диалог «Удалить переписку» — {pubkey, name} или null.
+	const [deleteTarget, setDeleteTarget] = useState(null);
+
+	// Находка 2 (CONTRACTS.md, этап 27): messagingActivity — диспетчер transport.js
+	// работает вне React re-render, этот сигнал сообщает "что-то изменилось".
+	useEffect(() => {
+		let cancelled = false;
+		async function refresh() {
+			try {
+				const partners = await listChatPartners(ownerPubkey, dbKey);
+				const inbox = await refreshInboxRequests(ownerPubkey, dbKey);
+				const unread = {};
+				for (const partnerPubkey of partners) {
+					unread[partnerPubkey] = await getUnreadCount(ownerPubkey, partnerPubkey);
+				}
+				// Время последней активности — только для подписи и порядка строк.
+				const lastAt = {};
+				for (const c of await listConversations(ownerPubkey, dbKey)) lastAt[c.chatId] = c.lastAt;
+				if (cancelled) return;
+				setLastAtByPartner(lastAt);
+				setChatPartners(partners);
+				setInboxList(inbox);
+				setUnreadByPartner(unread);
+				const allPubkeys = [...partners, ...inbox.map((r) => r.senderPubkey)];
+				if (allPubkeys.length > 0) {
+					// Найденный баг (пользователь, аватар собеседника без контакта не
+					// подгружался): fetchProfiles бросает "нет активного соединения", если
+					// вызвана раньше ensureConnected. Комментарий над ChatList всегда
+					// обещал, что этот вызов идемпотентен и безопасен отсюда — но сам вызов
+					// тут отсутствовал, а эффект Chat() (родителя), который реально
+					// подключается, коммитится ПОСЛЕ дочернего ChatList (React/Preact
+					// гарантируют порядок "снизу вверх" для useEffect на монтировании) —
+					// то есть на первом заходе (минуя "Контакты") fetchProfiles ГАРАНТИРОВАННО
+					// падал и профиль (в т.ч. аватар) собеседника без контакта, для которого
+					// это единственный шанс подгрузиться (нет постоянной live-подписки,
+					// см. refreshLiveProfileSubscription — она перечисляет только contacts),
+					// не подтягивался вообще, пока не прилетит новое сообщение от него.
+					try {
+						await ensureConnected(ownerPubkey, privKey, dbKey);
+						// Найденный баг (пользователь): ensureProfilesFetched никогда не обновляла
+						// уже закэшированное био/имя — refreshProfiles безусловно перезаписывает.
+						await refreshProfiles(allPubkeys, fetchProfiles);
+					} catch {
+						// Офлайн/сеть недоступна — список чатов всё равно показываем по уже
+						// загруженным локальным данным, профили подтянутся при следующем
+						// срабатывании эффекта (messagingActivity/повторное открытие экрана).
+					}
+				}
+			} catch (err) {
+				if (!cancelled) setListError(errorMessage(err));
+			}
+		}
+		refresh();
+		return () => {
+			cancelled = true;
+		};
+	}, [ownerPubkey, messagingActivity.value]);
+
+	async function runAction(fn) {
+		if (busyRef.current) return;
+		busyRef.current = true;
+		setListError("");
+		setBusy(true);
+		try {
+			await fn();
+		} catch (err) {
+			setListError(errorMessage(err));
+		} finally {
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	function handleAccept(senderPubkey) {
+		return runAction(async () => {
+			await acceptInboxRequestAction(ownerPubkey, privKey, dbKey, senderPubkey, refreshGroupMessageSubscription, publish);
+		});
+	}
+
+	// Переписка исчезает из списка на этом устройстве насовсем (надгробие, см.
+	// chat-delete.js), даже если контакт уже удалён или аккаунт собеседника мёртв.
+	function handleDeleteChat() {
+		const { pubkey } = deleteTarget;
+		setDeleteTarget(null);
+		return runAction(async () => {
+			await deleteChatForeverAction(ownerPubkey, privKey, dbKey, pubkey, publish, refreshGroupMessageSubscription);
+			setChatPartners((prev) => prev.filter((pk) => pk !== pubkey));
+		});
+	}
+
+	function handleReject(senderPubkey) {
+		return runAction(async () => {
+			await rejectInboxRequestAction(ownerPubkey, senderPubkey);
+			setInboxList((prev) => prev.filter((r) => r.senderPubkey !== senderPubkey));
+		});
+	}
+
+	// Пользователь: заголовки-секции "Входящие"/"Чаты" и заглушка "Нет новых
+	// запросов..." — лишний визуальный шум с огромными отступами между собой;
+	// остаётся только сам список (принять/отклонить для заявок незнакомцев —
+	// функционал сохранён, просто без подписи-секции, когда заявок нет —
+	// секция схлопывается целиком, а не показывает пустую заглушку).
+	const totalUnread = Object.values(unreadByPartner).reduce((sum, n) => sum + n, 0);
+
+	return (
+		<Screen
+			title={t("shell.navChats")}
+			actions={
+				<button type="button" onClick={onCompose}>
+					<IconPencil /> {t("chat.list.composeButton")}
+				</button>
+			}
+			feed
+		>
+			<div class="stack" style={{ "--gap": "var(--space-l)" }}>
+			{/* "Соединение: ..." переехало в постоянную панель под главным меню
+			    (app.jsx, ConnectionStatusPanel) — видна на любом экране (пользователь,
+			    item 4). */}
+			{listError && (
+				<p role="alert" style={{ color: "var(--bad)" }}>
+					{listError}
+				</p>
+			)}
+
+			{inboxList.length > 0 && (
+				<section class="stack" aria-label={t("chat.list.inboxHeading", { count: inboxList.length })} style={{ "--gap": "var(--space-s)" }}>
+					<ul role="list" class="inbox-list">
+						{inboxList.map((req) => (
+							<li key={req.senderPubkey} class="inbox-row">
+								<ContactIdentity pubkey={req.senderPubkey} />
+								<div class="inbox-row__actions">
+									<button type="button" class="btn--ghost btn--good" disabled={busy} onClick={() => handleAccept(req.senderPubkey)}>
+										{t("contacts.acceptButton")}
+									</button>
+									<button type="button" class="btn--ghost" disabled={busy} onClick={() => handleReject(req.senderPubkey)}>
+										{t("contacts.rejectButton")}
+									</button>
+								</div>
+							</li>
+						))}
+					</ul>
+				</section>
+			)}
+
+			<section class="stack" aria-label={t("chat.list.chatsHeading", { count: chatPartners.length })} style={{ "--gap": "var(--space-s)" }}>
+				{chatPartners.length === 0 ? (
+					<p class="empty-note">{t("chat.list.noChatsYet", { contactsLabel: t("nav.contacts") })}</p>
+				) : (
+					<ul role="list" class="chat-list">
+						{[...chatPartners]
+							.sort((a, b) => (lastAtByPartner[b] ?? 0) - (lastAtByPartner[a] ?? 0))
+							.map((pubkey) => {
+								const profile = profiles.value[pubkey];
+								const name = profile?.name || shortPubkey(pubkey);
+								const unread = unreadByPartner[pubkey] ?? 0;
+								return (
+									<li key={pubkey} class="chat-list__item">
+										<button type="button" class="chat-row" onClick={() => openChat(pubkey)} aria-label={t("contacts.openChatAria", { name })}>
+											<span class="chat-row__ava">
+												<AccountAvatar avatar={profile?.picture} login={name} />
+											</span>
+											<span class="chat-row__body">
+												<span class="chat-row__name">{name}</span>
+												{profile?.about && <span class="chat-row__snippet">{profile.about}</span>}
+											</span>
+											<span class="chat-row__meta">
+												{lastAtByPartner[pubkey] != null && <time class="chat-row__time">{formatRowTime(lastAtByPartner[pubkey] * 1000)}</time>}
+												{unread > 0 && (
+													<span class="chat-row__badge" aria-label={t("chat.list.unreadAria", { count: unread })}>
+														{unread}
+													</span>
+												)}
+											</span>
+										</button>
+										<FavStar kind="person" id={pubkey} name={name} />
+										<button
+											type="button"
+											class="chat-list__delete"
+											disabled={busy}
+											onClick={() => setDeleteTarget({ pubkey, name })}
+											aria-label={t("chat.list.deleteAria", { name })}
+											title={t("chat.list.deleteAria", { name })}
+										>
+											<IconTrash />
+										</button>
+									</li>
+								);
+							})}
+					</ul>
+				)}
+			</section>
+			</div>
+			{deleteTarget && <DeleteChatDialog name={deleteTarget.name} busy={busy} onCancel={() => setDeleteTarget(null)} onConfirm={handleDeleteChat} />}
+		</Screen>
+	);
+}
+
+function ChatWindow({ ownerPubkey, privKey, dbKey, contactPubkey }) {
+	// Этап 60 — kind:445 (MLS group message, отправка/удаление/правка — все три
+	// используют chat.js's sendMessage под капотом, см. deletions.js/edits.js)
+	// не несёт тега #p (адресация по #h группы, эфемерный отправитель), поэтому
+	// generic publish()'s auto-детект получателя тут не сработает — получатель
+	// передаётся явно.
+	const publishToChatPartner = (event) => publishToContact(event, contactPubkey);
+	const [messages, setMessages] = useState([]);
+	const [hasMore, setHasMore] = useState(false);
+	const [text, setText] = useState("");
+	const [error, setError] = useState("");
+	// Ответ на сообщение / цитата выделенного: ссылка, которая уйдёт вместе со следующим сообщением (domain/messaging/reply.js).
+	const [replyDraft, setReplyDraft] = useState(null);
+	// HEADERS (CONTRACTS.md §HEADERS), этап 1 — срез по типу вложения; "all" по
+	// умолчанию сбрасывает его при каждом новом входе в чат (state локален
+	// компоненту, не персистируется), продуктовое решение пользователя.
+	const [typeFilter, setTypeFilter] = useState("all");
+	const [attachmentLayout, setAttachmentLayout] = useState("grid");
+	// Ошибки самой отправки (текст/вложение/голос) — отдельно от error (тот уходит в
+	// ленту сообщений через Screen's children и не виден пользователю при длинной
+	// истории). Рендерится в footer, рядом с кнопкой "Отправить" — там, где
+	// пользователь только что кликнул.
+	const [composeError, setComposeError] = useState("");
+	const [busy, setBusy] = useState(false);
+	const busyRef = useRef(false);
+	const draftTimerRef = useRef(null);
+	const composerTextareaRef = useRef(null);
+	// Упущение пользователя (не баг): при входе в чат нужна автопрокрутка к последнему
+	// сообщению. bottomRef — сентинел ПОСЛЕ последнего сообщения; scrollIntoView() сам
+	// находит реально скроллящегося предка — после переезда на общий каркас (screen.jsx)
+	// это .content-wrapper (position:absolute;inset:0;overflow-y:auto), не document.
+	// pendingScrollRef взводится при смене contactPubkey (список messages грузится
+	// АСИНХРОННО отдельным эффектом ниже) — прокрутка срабатывает один раз, когда messages
+	// реально обновится, а не на каждое последующее фоновое сообщение (иначе выдёргивала
+	// бы пользователя, читающего историю выше).
+	const bottomRef = useRef(null);
+	const pendingScrollRef = useRef(false);
+	// Найдено живым E2E-прогоном (мультиаккаунт, не гипотеза): асинхронная загрузка
+	// черновика при монтировании МОЖЕТ резолвиться ПОСЛЕ того, как пользователь уже начал
+	// печатать — тогда setText(draft) стирает уже введённый текст. В обычном человеческом
+	// использовании это маловероятно (БД быстрее печати), но не гарантировано. Как только
+	// пользователь хоть раз редактировал текст — асинхронная загрузка черновика больше не
+	// имеет права его перезаписывать. Сбрасывается при смене contactPubkey (новый чат).
+	const userEditedRef = useRef(false);
+
+	// Этап 29 — вложения; этап B4 — лоток мультивыбора (useAttachmentTray, B3).
+	// Лоток и voice (запись, useVoiceRecording) ВЗАИМОИСКЛЮЧАЮЩИЕ — сообщение
+	// несёт либо вложения, либо голосовое, не оба сразу (тот же принцип, что
+	// большинство мессенджеров). Кнопки/UI записи — ComposeAttachButtons/
+	// VoiceRecordingStatus (compose-attach-tools.jsx), общие с CommentComposer/
+	// ChannelComposer (живой фидбег — три композитора должны выглядеть и уметь
+	// одно и то же).
+	const tray = useAttachmentTray({ maxItems: MAX_ATTACHMENTS_PER_MESSAGE });
+	const voice = useVoiceRecording();
+	const [uploadingAttachment, setUploadingAttachment] = useState(false);
+	const [uploadFraction, setUploadFraction] = useState(0);
+
+	useEffect(() => {
+		// Найденный баг (пользователь): при входе в чат подтягиваем СВЕЖИЙ профиль
+		// собеседника (refreshProfiles), а не только "если ещё не кэширован".
+		refreshProfiles([contactPubkey], fetchProfiles).catch(() => {});
+	}, [contactPubkey]);
+
+	useEffect(() => {
+		pendingScrollRef.current = true;
+	}, [contactPubkey]);
+
+	useEffect(() => {
+		// messages стартует с [] и этот эффект тоже срабатывает на самом первом рендере —
+		// длину проверяем, чтобы не погасить pendingScrollRef на пустом начальном значении
+		// ДО того, как асинхронный loadChatWindow реально подгрузит историю.
+		if (pendingScrollRef.current && messages.length > 0 && bottomRef.current) {
+			bottomRef.current.scrollIntoView({ block: "end" });
+			pendingScrollRef.current = false;
+		}
+	}, [messages]);
+
+	useEffect(() => {
+		let cancelled = false;
+		async function load() {
+			const { messages: freshWindow, hasMore: more } = await loadChatWindow(ownerPubkey, contactPubkey, dbKey, { limit: 100 });
+			if (cancelled) return;
+			setMessages(freshWindow);
+			setHasMore(more);
+			if (freshWindow.length > 0) {
+				const lastLamportTs = freshWindow[freshWindow.length - 1].lamportTs;
+				// НАЙДЕНО ПОЛЬЗОВАТЕЛЕМ (этап 47-довесок): прочтение — ЛОКАЛЬНОЕ действие,
+				// не бампает messagingActivity (тот бампается только входящими событиями из
+				// transport.js) — без явного пересчёта здесь бейдж "Сообщения [N]" в нave
+				// оставался бы прежним навсегда после открытия чата.
+				await markChatReadAction(ownerPubkey, privKey, dbKey, contactPubkey, lastLamportTs, publish).catch(() => {});
+				refreshUnreadMessagesCount(ownerPubkey).catch(() => {});
+				if (typeof document === "undefined" || document.visibilityState === "visible") {
+					armPeerCursorAck(ownerPubkey, privKey, dbKey, contactPubkey, publishToChatPartner);
+				}
+			}
+		}
+		load();
+		return () => {
+			cancelled = true;
+		};
+		// messagingActivity.value — находка 2: новое входящее сообщение перезагружает окно
+	}, [ownerPubkey, privKey, contactPubkey, messagingActivity.value]);
+
+	// ОТДЕЛЬНО от загрузки окна сообщений (найдено живым тестированием, не домысел):
+	// черновик подтягивается ТОЛЬКО при смене контакта, не на каждый messagingActivity —
+	// иначе входящее сообщение фоном стирало бы уже вводимый (ещё не сохранённый) текст
+	// пользователя, перезаписывая его последним ЗАСОХРАНЁННЫМ черновиком.
+	useEffect(() => {
+		userEditedRef.current = false;
+		let cancelled = false;
+		getDraft(ownerPubkey, dbKey, contactPubkey).then((draft) => {
+			if (!cancelled && !userEditedRef.current) setText(draft);
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [ownerPubkey, contactPubkey]);
+
+	// Черновик не сохраняется на КАЖДОЕ нажатие клавиши (лишняя публикация kind 30071) —
+	// debounce 1с; таймер отменяется при размонтировании/смене чата, чтобы не сохранить
+	// черновик УЖЕ другого contactPubkey из устаревшего замыкания.
+	useEffect(() => {
+		return () => {
+			if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+		};
+	}, [contactPubkey]);
+
+	// Markdown-этап D — извлечено из handleTextInput, чтобы панель форматирования
+	// (программная вставка, не пользовательский onInput-event) шла тем же путём
+	// (черновик обязан сохраняться и после вставки разметки кнопкой).
+	function applyTextChange(value) {
+		userEditedRef.current = true;
+		setText(value);
+		if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+		draftTimerRef.current = setTimeout(() => {
+			saveChatDraftAction(ownerPubkey, privKey, dbKey, contactPubkey, value, publish).catch(() => {});
+		}, 1000);
+	}
+
+	function handleTextInput(e) {
+		applyTextChange(e.currentTarget.value);
+	}
+
+	// Известное упрощение MVP: перезагружает ПОСЛЕДНИЕ 100, не сохраняя ранее
+	// подгруженную (через "Загрузить более старые") историю выше — если пользователь
+	// проскроллил вверх, отправка/удаление сообщения молча возвращает его к низу.
+	// Не теряет данные (просто нужно заново нажать "Загрузить более старые" при
+	// следующем скролле) — полировка отложена (backlog, этап 32).
+	async function reloadWindow() {
+		const { messages: freshWindow, hasMore: more } = await loadChatWindow(ownerPubkey, contactPubkey, dbKey, { limit: 100 });
+		setMessages(freshWindow);
+		setHasMore(more);
+	}
+
+	async function handleLoadMore() {
+		if (messages.length === 0) return;
+		const oldestSeq = messages[0].seq;
+		const { messages: older, hasMore: more } = await loadChatWindow(ownerPubkey, contactPubkey, dbKey, { limit: 100, beforeSeq: oldestSeq });
+		setMessages((prev) => [...older, ...prev]);
+		setHasMore(more);
+		if (older.length > 0) await markWindowLoaded(ownerPubkey, dbKey, contactPubkey, older[0].seq);
+	}
+
+	// Строит дескриптор вложения (F-AT-02) из выбранного файла или записанного голоса.
+	// Возвращает undefined, если нечего прикреплять (обычное текстовое сообщение).
+	// Этап B4 медиа-подсистемы — лоток и голос взаимоисключающие (гарантировано
+	// UI: старт записи вызывает tray.reset(), выбор файла сбрасывает запись),
+	// поэтому здесь простое ветвление, не слияние.
+	async function buildOutgoingAttachments() {
+		const journal = { purpose: "dm", target: contactPubkey }; // ТЗ-03: куда уходит файл
+		if (tray.items.length > 0) return tray.uploadAll(privKey, undefined, { journal, onBytes: setUploadFraction });
+		if (voice.hasRecording) {
+			const descriptor = await voice.buildAttachment(privKey, { journal });
+			return descriptor ? [descriptor] : undefined;
+		}
+		return undefined;
+	}
+
+	async function handleSend(e) {
+		e.preventDefault();
+		if (busyRef.current) return;
+		if (text.length === 0 && tray.items.length === 0 && !voice.hasRecording) return; // нечего отправлять
+		if (tray.items.some((item) => item.error)) return; // невалидное вложение — сначала убрать/заменить
+		if (text.length > MAX_MESSAGE_LENGTH) {
+			setComposeError(t("chat.window.messageTooLong", { max: MAX_MESSAGE_LENGTH }));
+			return;
+		}
+		busyRef.current = true;
+		setComposeError("");
+		setBusy(true);
+		traceDelivery("ui.send.click", { contactPubkey });
+		try {
+			// Загрузка на Blossom (если есть вложение) — ДО тика Lamport-часов и
+			// отправки: сбой загрузки не должен продвигать часы/создавать пустой tick
+			// впустую, и вложение/голос ОСТАЮТСЯ в состоянии компоновки для повторной
+			// попытки (не теряются на сетевой ошибке).
+			setUploadingAttachment(true);
+			const attachments = await buildOutgoingAttachments();
+			setUploadingAttachment(false);
+
+			const lamportTs = await nextLamportTick(ownerPubkey);
+			await sendChatMessageAction(
+				ownerPubkey,
+				privKey,
+				dbKey,
+				contactPubkey,
+				text,
+				lamportTs,
+				publishToChatPartner,
+				fetchDeviceKeyPackages,
+				refreshGroupMessageSubscription,
+				attachments,
+				{ replyTo: replyDraft ?? undefined },
+			);
+			if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+			setText("");
+			setReplyDraft(null);
+			tray.reset();
+			voice.reset();
+			await saveChatDraftAction(ownerPubkey, privKey, dbKey, contactPubkey, "", publish).catch(() => {});
+			// Найдено пользователем — собственное только что отправленное сообщение
+			// оставалось скрыто ЗА полем ввода (эффект на [messages] ниже скроллит
+			// только на вход в чат/первую загрузку истории — иначе выдёргивал бы
+			// того, кто листает историю выше, при ЧУЖОМ входящем сообщении). Своя
+			// отправка — другое дело: раз я сам только что напечатал и отправил,
+			// я однозначно у низа переписки, прокрутка ожидаема всегда.
+			pendingScrollRef.current = true;
+			await reloadWindow();
+		} catch (err) {
+			setComposeError(errorMessage(err));
+		} finally {
+			setUploadingAttachment(false);
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	// Смайл (меню «+» -> «Смайлы») отправляется СРАЗУ отдельным сообщением, минуя
+	// черновик text/tray/recordedVoiceBlob — клик не должен трогать то, что
+	// пользователь уже набирает в поле ввода.
+	async function sendQuickMessage(value) {
+		if (busyRef.current) return;
+		busyRef.current = true;
+		setComposeError("");
+		setBusy(true);
+		try {
+			const lamportTs = await nextLamportTick(ownerPubkey);
+			await sendChatMessageAction(ownerPubkey, privKey, dbKey, contactPubkey, value, lamportTs, publishToChatPartner, fetchDeviceKeyPackages, refreshGroupMessageSubscription, undefined, { replyTo: replyDraft ?? undefined });
+			setReplyDraft(null);
+			pendingScrollRef.current = true; // см. комментарий в handleSend — своя отправка всегда скроллит к низу
+			await reloadWindow();
+		} catch (err) {
+			setComposeError(errorMessage(err));
+		} finally {
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	async function handleDeleteForBoth(msgId) {
+		if (busyRef.current) return;
+		busyRef.current = true;
+		setBusy(true);
+		try {
+			const lamportTs = await nextLamportTick(ownerPubkey);
+			await deleteChatMessageAction(ownerPubkey, privKey, dbKey, contactPubkey, msgId, lamportTs, publishToChatPartner);
+			await reloadWindow();
+		} catch (err) {
+			setError(errorMessage(err));
+		} finally {
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	// "Удалить у себя" — чисто локально (нет сети, нет ожидания relay) — busy-блокировка
+	// не нужна, но reloadWindow всё равно async.
+	async function handleDeleteForMe(msgId) {
+		try {
+			await deleteMessageForMeAction(ownerPubkey, contactPubkey, msgId);
+			await reloadWindow();
+		} catch (err) {
+			setError(errorMessage(err));
+		}
+	}
+
+	// HEADERS (CONTRACTS.md §HEADERS), этап 1 — заменяет classesInMessages +
+	// openChatMediaClass:
+	// клик по срезу больше не открывает оверлей мгновенно, а переключает
+	// ленту на плитку/список вложений класса (как экран "Файлы"), через
+	// общий <AttachmentSlices>. ВЕСЬ scope, БЕЗ фильтра по классу —
+	// AttachmentSlices сам считает counts и сам фильтрует (единственный
+	// источник правды на оба действия). Пары {message, attachment} — не
+	// MediaRef (collectChatScope отдаёт уже resolved ref без исходного
+	// attachment-объекта, а CollectionTile/AttachmentView нужен именно
+	// attachment).
+	// Голосовые вложения исключены — тот же принцип, что уже применяет
+	// collectChatScope (scope.js: "a.voice ? null : ..."): голосовое не
+	// входит в playlist openMedia, показать его плиткой/строкой, а потом
+	// не суметь открыть по клику (findRefPosition не найдёт его в refs) —
+	// хуже, чем не показать вовсе. Живой фидбек пользователя.
+	function allAttachmentItems() {
+		const result = [];
+		for (const message of messages) {
+			for (const attachment of message.attachments || []) {
+				if (attachment.voice) continue;
+				result.push({ message, attachment });
+			}
+		}
+		return result;
+	}
+
+	// Плейлист СТРОГО из отфильтрованной (видимой) выборки, не всего чата —
+	// тот же принцип, что files.jsx's openVisibleMedia.
+	function openFilteredMedia(typeFilter, message, attachment) {
+		const refs = collectChatScope(messages).filter((r) => classOf(r.mime) === typeFilter);
+		const target = refFromAttachment(attachment, { msgId: message.id });
+		const position = findRefPosition(refs, target.digest, target.sourceMeta);
+		if (position === -1) return;
+		openMedia({ refs, position });
+	}
+
+	// Этап F, F1/F2 (CONTRACTS.md/DESIGN.md "Этап F") — клик по КОНКРЕТНОМУ
+	// вложению в пузыре. sourceMeta {msgId: message.id} — тот же ключ, что уже
+	// строит collectChatScope сам (Этап A), иначе findRefPosition не найдёт
+	// совпадение (message.id — nostr event.id, НЕ message.msgId, тот другой
+	// стабильный идентификатор для edit/delete — Stage A's контракт, не бага).
+	function openAttachment(message, attachment) {
+		const refs = collectChatScope(messages);
+		const target = refFromAttachment(attachment, { msgId: message.id });
+		const position = findRefPosition(refs, target.digest, target.sourceMeta);
+		if (position === -1) return;
+		openMedia({ refs, position });
+	}
+
+	async function handleClearHistory() {
+		if (!window.confirm(t("chat.window.clearHistoryConfirm"))) return;
+		try {
+			await clearChatHistoryAction(ownerPubkey, contactPubkey);
+			await reloadWindow();
+		} catch (err) {
+			setError(errorMessage(err));
+		}
+	}
+
+	async function handleEdit(msgId, newText) {
+		if (busyRef.current) return;
+		if (newText.length > MAX_MESSAGE_LENGTH) {
+			setError(t("chat.window.messageTooLong", { max: MAX_MESSAGE_LENGTH }));
+			return;
+		}
+		busyRef.current = true;
+		setBusy(true);
+		try {
+			const lamportTs = await nextLamportTick(ownerPubkey);
+			await editChatMessageAction(ownerPubkey, privKey, dbKey, contactPubkey, msgId, newText, lamportTs, publishToChatPartner);
+			await reloadWindow();
+		} catch (err) {
+			setError(errorMessage(err));
+		} finally {
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	const profile = profiles.value[contactPubkey];
+	const displayName = profile?.name || shortPubkey(contactPubkey);
+
+	// Ответ/цитата/реакция/переход к исходному сообщению.
+	function replyAuthorName(pubkey) {
+		return pubkey === ownerPubkey ? t("message.replyYou") : profiles.value[pubkey]?.name || shortPubkey(pubkey);
+	}
+	function startReply(message, quote) {
+		const replyTo = buildReplyTo(message, quote);
+		if (!replyTo) return;
+		setReplyDraft(replyTo);
+		composerTextareaRef.current?.focus();
+	}
+	function quoteSelection(msgId, quoteText) {
+		const message = messages.find((m) => m.msgId === msgId);
+		if (message) startReply(message, quoteText);
+	}
+	async function handleReact(msgId, emojiId) {
+		try {
+			const lamportTs = await nextLamportTick(ownerPubkey);
+			await reactChatMessageAction(ownerPubkey, privKey, dbKey, contactPubkey, msgId, emojiId, lamportTs, publishToChatPartner);
+			await reloadWindow();
+		} catch (err) {
+			setError(errorMessage(err));
+		}
+	}
+	function jumpToMessage(msgId) {
+		const el = document.querySelector(`.message-list [data-msg-id="${msgId}"]`);
+		if (!el) return; // исходное сообщение ещё не подгружено — переходить некуда
+		el.scrollIntoView({ block: "center", behavior: "smooth" });
+		el.classList.add("is-jump-target");
+		setTimeout(() => el.classList.remove("is-jump-target"), 1600);
+	}
+
+	// Этап 1 (MESSAGE-DELIVERY-TZ.md, З1.4) — плашка выводится из ДАННЫХ, не из
+	// локального состояния конкретного клика: строка "queued" уже своего
+	// сообщения означает "переписка ещё не создана, жду коммиттера/sibling-
+	// Welcome" (chat.js, ensureChatEstablished И3/И4), независимо от того, кто
+	// и когда нажал "Отправить" — переживает reload и работает даже если
+	// сообщение было отправлено в прошлой сессии. Исчезает сама, как только
+	// messagingActivity перезагрузит окно и статус сменится (drain выполнился).
+	const ownQueuedMessages = messages.filter((m) => m.senderPubkey === ownerPubkey && m.status === "queued");
+	const awaitingCommitter = ownQueuedMessages.length > 0;
+	const oldestQueuedAt = awaitingCommitter ? Math.min(...ownQueuedMessages.map((m) => m.sentAt)) : null;
+
+	// Этап 5 (MESSAGE-DELIVERY-TZ.md, З5.6) — "заявка не принята": collectPubkey
+	// НЕ входит в contacts.value (заявку ещё не приняли) И от него в этом чате
+	// НИ РАЗУ не приходило ни одного сообщения — relay мог принять публикацию
+	// (status "sent"), но получатель физически не в MLS-группе, пока не примет
+	// Welcome из своего inbox (chat.js/inbox-requests.js) — "галочка" здесь лжёт.
+	// Проверяется ТОЛЬКО для isKnownContact===false (contacts.value), иначе
+	// обычное молчание УЖЕ подтверждённого контакта ложно читалось бы как отказ.
+	const partnerHasWrittenHere = messages.some((m) => m.senderPubkey === contactPubkey);
+	const pendingStrangerAcceptance = !contacts.value.includes(contactPubkey) && !partnerHasWrittenHere;
+
+	// Этап 4 (MESSAGE-DELIVERY-TZ.md, вариант C) — "счётчик времени в очереди":
+	// тикает, только пока реально есть что показывать — не крутить лишний
+	// таймер в фоне для чатов без ожидающих сообщений.
+	const [nowTick, setNowTick] = useState(Date.now());
+	const [lastSeenAt, setLastSeenAt] = useState(null);
+	const [peerCursor, setPeerCursor] = useState({ deliveredUpTo: 0, readUpTo: 0 });
+	useEffect(() => {
+		if (!awaitingCommitter) return;
+		const id = setInterval(() => setNowTick(Date.now()), 30000);
+		return () => clearInterval(id);
+	}, [awaitingCommitter]);
+	useEffect(() => {
+		const id = setInterval(() => setNowTick(Date.now()), 60_000);
+		return () => clearInterval(id);
+	}, []);
+	useEffect(() => {
+		let cancelled = false;
+		getPeerLastSeenAt(ownerPubkey, contactPubkey).then((v) => {
+			if (!cancelled) setLastSeenAt(v);
+		});
+		getPeerCursor(ownerPubkey, contactPubkey).then((row) => {
+			if (!cancelled) setPeerCursor(row);
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [ownerPubkey, contactPubkey, messagingActivity.value]);
+	useEffect(() => {
+		function onVis() {
+			if (document.visibilityState !== "visible") return;
+			armPeerCursorAck(ownerPubkey, privKey, dbKey, contactPubkey, publishToChatPartner);
+		}
+		document.addEventListener("visibilitychange", onVis);
+		if (document.visibilityState === "visible") onVis();
+		return () => {
+			document.removeEventListener("visibilitychange", onVis);
+			flushCursorNow(ownerPubkey, contactPubkey);
+		};
+	}, [ownerPubkey, privKey, dbKey, contactPubkey]);
+
+	function formatQueuedDuration(sinceSeconds, nowMs) {
+		const totalSeconds = Math.max(0, Math.floor(nowMs / 1000) - sinceSeconds);
+		const minutes = Math.floor(totalSeconds / 60);
+		if (minutes < 1) return t("chat.window.awaitingCommitterDurationSeconds");
+		if (minutes < 60) return t("chat.window.awaitingCommitterDurationMinutes", { minutes });
+		return t("chat.window.awaitingCommitterDurationHours", { hours: Math.floor(minutes / 60) });
+	}
+
+	const [resendState, setResendState] = useState(null); // null | "sending" | "sent"
+	async function handleResendChatOpenRequest() {
+		setResendState("sending");
+		try {
+			await resendChatOpenRequestAction(privKey, contactPubkey, publishToChatPartner);
+			setResendState("sent");
+			setTimeout(() => setResendState(null), 4000);
+		} catch {
+			setResendState(null);
+		}
+	}
+
+	// «Назад» ведёт туда, откуда пришли: из «Контактов» — в контакты, иначе в список чатов.
+	const backTo = getChatBackTo();
+	const chatBreadcrumb = backTo
+		? { label: t("nav.contacts"), onBack: () => goTo(backTo) }
+		: { label: t("shell.navChats"), onBack: () => openChat(null) };
+
+	return (
+		<Screen
+			breadcrumb={chatBreadcrumb}
+			lead={<AccountAvatar avatar={profile?.picture} login={displayName} />}
+			title={displayName}
+			subtitle={(() => {
+				const clamped = clampLastSeenAt(lastSeenAt, Math.floor(nowTick / 1000));
+				return formatLastSeen(clamped == null ? null : clamped * 1000, nowTick, { locale: currentLocale.value }) || undefined;
+			})()}
+			actions={
+				<>
+					{/* Найдено пользователем (мобильный) — текст кнопки никогда не
+					    сжимался в иконку: готовое правило .header-actions .btn-label
+					    {display:none} (@container width<30rem) существовало, но
+					    текст нигде не был обёрнут в этот класс — "Позвонить" с
+					    полным текстом распирал и без того тесную строку шапки
+					    (шла внахлёст с глобальным бургером в углу). */}
+					<button type="button" class="icon-btn" onClick={() => placeCall(contactPubkey)} aria-label={t("contacts.callAria", { name: displayName })}>
+						<IconPhoneCall />
+					</button>
+					<ActionsMenu label={t("chat.window.chatMenuAria")}>
+						{/* Живой фидбег — пункт добавлен заранее (вид меню важнее самой
+						    функции на этом этапе), сама функциональность (поиск по
+						    сообщениям чата) — отдельная задача, disabled до её реализации. */}
+						<button type="button" disabled title={t("chat.window.searchChatSoon")}>
+							<IconMagnifyingGlass /> {t("chat.window.searchChatMenu")}
+						</button>
+						<button type="button" class="danger" onClick={handleClearHistory}>
+							<IconEraser /> {t("chat.window.clearHistoryMenu")}
+						</button>
+					</ActionsMenu>
+				</>
+			}
+			feed
+			footer={
+				<div class="stack" style={{ "--gap": "var(--space-2xs)" }}>
+					{awaitingCommitter && (
+						<div class="row" style={{ "--gap": "var(--space-s)", "--align": "center" }}>
+							<p class="panel__hint" role="status" style={{ margin: 0 }}>
+								{t("chat.window.awaitingCommitter")} {formatQueuedDuration(oldestQueuedAt, nowTick)}
+							</p>
+							<button type="button" class="btn--ghost rigid" onClick={handleResendChatOpenRequest} disabled={resendState === "sending"}>
+								{resendState === "sent" ? t("chat.window.awaitingCommitterResendDone") : t("chat.window.awaitingCommitterResend")}
+							</button>
+						</div>
+					)}
+
+					{composeError && (
+						<p role="alert" style={{ color: "var(--bad)" }}>
+							{composeError}
+						</p>
+					)}
+
+					{replyDraft && (
+						<div class="reply-draft row" style={{ "--gap": "var(--space-xs)", "--align": "center" }}>
+							<IconCornerBack aria-hidden="true" />
+							<span class="reply-draft__body grow">
+								<strong>{t("message.replyingTo", { name: replyAuthorName(replyDraft.senderPubkey) })}</strong>
+								<span class="reply-draft__text">
+									{parseStickerKey(replyDraft.excerpt) ? <EmojiGlyph id={parseStickerKey(replyDraft.excerpt)} /> : replyDraft.excerpt || (replyDraft.att ? t("message.replyAttachment") : "…")}
+								</span>
+							</span>
+							<button type="button" class="icon-btn" onClick={() => setReplyDraft(null)} aria-label={t("message.replyCancel")} title={t("message.replyCancel")}>
+								<IconCross />
+							</button>
+						</div>
+					)}
+
+					{(tray.items.length > 0 || tray.errors.length > 0) && (
+						<AttachmentTray items={tray.items} errors={tray.errors} onRemove={tray.remove} layout={tray.layout} onLayoutChange={tray.setLayout} />
+					)}
+
+					<VoiceRecordingStatus voice={voice} />
+
+					{uploadingAttachment && (
+						<p class="row recording-status" style={{ "--gap": "var(--space-s)", "--align": "center" }} role="status">
+							<span class="spinner" aria-hidden="true" /> {t("chat.window.uploadingAttachment")}
+							<progress class="upload-progress" max="100" value={Math.round(uploadFraction * 100)} aria-label={t("chat.window.uploadingAttachment")} />
+							<span class="upload-percent">{Math.round(uploadFraction * 100)}%</span>
+						</p>
+					)}
+
+					<form class="composer bar" style={{ "--gap": "var(--space-2xs)", "--align": "center" }} onSubmit={handleSend}>
+						<div class="composer__attach">
+							<ComposeAttachButtons tray={tray} voice={voice} onError={setError} onSendEmoji={sendQuickMessage} />
+						</div>
+						<label class="visually-hidden" for="chat-message-input">
+							{t("chat.window.messageLabel")}
+						</label>
+						<div class="composer__field">
+							<textarea
+								id="chat-message-input"
+								ref={composerTextareaRef}
+								class="message-compose-field"
+								value={text}
+								placeholder={t("chat.window.messageLabel")}
+								maxLength={MAX_MESSAGE_LENGTH}
+								onInput={handleTextInput}
+								onKeyDown={(e) => {
+									if (!isComposeSubmitKey(e)) return;
+									e.preventDefault();
+									handleSend(e);
+								}}
+								rows={1}
+							/>
+						</div>
+						<button
+							type="submit"
+							class="message-compose-send-btn row"
+							style={{ "--align": "center", justifyContent: "center" }}
+							disabled={busy || (text.length === 0 && tray.items.length === 0 && !voice.hasRecording) || tray.items.some((item) => item.error)}
+							aria-label={t("common.send")}
+						>
+							<IconSend />
+						</button>
+					</form>
+					{/* Панель выделения — ПОД полем: системное меню выделения Android рисуется НАД выделенным текстом и
+					    перекрывалось панелью, стоявшей над полем. */}
+					<SelectionFormatBar textareaRef={composerTextareaRef} value={text} onChange={applyTextChange} />
+				</div>
+			}
+		>
+			<AttachmentSlices
+				items={allAttachmentItems()}
+				typeFilter={typeFilter}
+				onSelectType={setTypeFilter}
+				layout={attachmentLayout}
+				onLayoutChange={setAttachmentLayout}
+				onOpenItem={(item) => openFilteredMedia(typeFilter, item.message, item.attachment)}
+			>
+				{error && (
+					<p role="alert" style={{ color: "var(--bad)" }}>
+						{error}
+					</p>
+				)}
+				{hasMore && (
+					<button type="button" onClick={handleLoadMore}>
+						{t("chat.window.loadOlderButton")}
+					</button>
+				)}
+				{messages.length === 0 && <p style={{ color: "var(--muted)" }}>{t("chat.window.noMessagesYet")}</p>}
+				<div class="message-list stack" style={{ "--gap": "var(--space-2xs)" }}>
+					{messages.map((message) => {
+						const isOwn = message.senderPubkey === ownerPubkey;
+						return (
+							<MessageBubble
+								key={message.msgId}
+								message={message}
+								isOwn={isOwn}
+								onDeleteForMe={handleDeleteForMe}
+								onDeleteForBoth={isOwn ? handleDeleteForBoth : undefined}
+								onEdit={isOwn ? handleEdit : undefined}
+								onReply={(m) => startReply(m)}
+								onReact={handleReact}
+								myPubkey={ownerPubkey}
+								replyAuthorName={replyAuthorName}
+								onJumpToMessage={jumpToMessage}
+								maxLength={MAX_MESSAGE_LENGTH}
+								onOpenAttachment={openAttachment}
+								pendingAcceptance={pendingStrangerAcceptance}
+								deliveredUpTo={peerCursor.deliveredUpTo}
+								readUpTo={peerCursor.readUpTo}
+							/>
+						);
+					})}
+					<div ref={bottomRef} />
+				</div>
+				<QuoteSelectionButton onQuote={quoteSelection} />
+			</AttachmentSlices>
+		</Screen>
+	);
+}
+
+// "Написать" (header-actions ChatList) — короткая форма "кому/текст/вложение",
+// БЕЗ повторной реализации отправки+вложений: и то, и другое — те же функции,
+// что уже использует ChatWindow (sendChatMessageAction/buildOutgoingAttachment
+// логика вложения скопирована в укороченном виде — без голосовых/из хранилища,
+// пользователь просил именно "выбрать и отправить файлы"). После отправки —
+// сразу переход в открывшийся чат (openChat), как и ожидал бы пользователь.
+function ComposeMessage({ ownerPubkey, privKey, dbKey, onCancel, onSent }) {
+	const [to, setTo] = useState("");
+	const [text, setText] = useState("");
+	const tray = useAttachmentTray({ maxItems: MAX_ATTACHMENTS_PER_MESSAGE });
+	const [error, setError] = useState("");
+	const [busy, setBusy] = useState(false);
+	const busyRef = useRef(false);
+	const composeTextareaRef = useRef(null);
+
+	useEffect(() => {
+		// Тот же приём, что в contacts.jsx: сначала пересчёт из уже загруженной
+		// (с прошлого захода) Map, затем — свежие данные после подключения, чтобы
+		// datalist "Кому" не оставался пустым, если пользователь попал в
+		// "Сообщения" напрямую, минуя "Контакты" в этой сессии.
+		refreshAll();
+		ensureConnected(ownerPubkey, privKey, dbKey)
+			.then(async () => {
+				refreshAll();
+				await refreshProfiles(contacts.value, fetchProfiles).catch(() => {});
+			})
+			.catch(() => notifyConnectionTrouble());
+	}, [ownerPubkey]);
+
+	function handleFilesSelected(e) {
+		// FileList — живая ссылка на список инпута: addFiles() должен уйти
+		// ДО обнуления value (см. тот же комментарий в ChatWindow).
+		const files = e.currentTarget.files;
+		if (!files || files.length === 0) return;
+		tray.addFiles(files);
+		e.currentTarget.value = "";
+	}
+
+	function resolveRecipient() {
+		const trimmed = to.trim();
+		return contacts.value.includes(trimmed) ? trimmed : null;
+	}
+
+	async function handleSend(e) {
+		e.preventDefault();
+		if (busyRef.current) return;
+		const recipient = resolveRecipient();
+		if (!recipient) {
+			setError(t("chat.list.composeInvalidRecipient"));
+			return;
+		}
+		if (text.length === 0 && tray.items.length === 0) return;
+		if (tray.items.some((item) => item.error)) return;
+		if (text.length > MAX_MESSAGE_LENGTH) {
+			setError(t("chat.window.messageTooLong", { max: MAX_MESSAGE_LENGTH }));
+			return;
+		}
+		busyRef.current = true;
+		setError("");
+		setBusy(true);
+		try {
+			const attachments = tray.items.length > 0 ? await tray.uploadAll(privKey, undefined, { journal: { purpose: "dm", target: recipient } }) : undefined;
+			await ensureConnected(ownerPubkey, privKey, dbKey);
+			const publishToRecipient = (event) => publishToContact(event, recipient);
+			const lamportTs = await nextLamportTick(ownerPubkey);
+			await sendChatMessageAction(ownerPubkey, privKey, dbKey, recipient, text, lamportTs, publishToRecipient, fetchDeviceKeyPackages, refreshGroupMessageSubscription, attachments);
+			onSent(recipient);
+		} catch (err) {
+			setError(errorMessage(err));
+		} finally {
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	return (
+		<Screen
+			title={t("chat.list.composeTitle")}
+			actions={
+				<button type="button" onClick={onCancel}>
+					<IconArrowLeft /> {t("chat.list.backToChatsButton")}
+				</button>
+			}
+		>
+			{error && (
+				<p role="alert" style={{ color: "var(--bad)" }}>
+					{error}
+				</p>
+			)}
+			<form class="stack" style={{ "--gap": "var(--space-s)" }} onSubmit={handleSend}>
+				<label class="stack" style={{ "--gap": "var(--space-3xs)" }}>
+					<span>{t("chat.list.toLabel")}</span>
+					<input list="compose-to-contacts" id="contacts" name="contacts-list" value={to} onInput={(e) => setTo(e.currentTarget.value)} autocomplete="off" />
+					<datalist id="compose-to-contacts">
+						{contacts.value.map((pk) => (
+							<option key={pk} value={pk}>
+								{profiles.value[pk]?.name || shortPubkey(pk)}
+							</option>
+						))}
+					</datalist>
+				</label>
+				<label class="stack" style={{ "--gap": "var(--space-3xs)" }}>
+					<span>{t("chat.window.messageLabel")}</span>
+					<span class="selection-format-host">
+						<textarea ref={composeTextareaRef} value={text} maxLength={MAX_MESSAGE_LENGTH} onInput={(e) => setText(e.currentTarget.value)} rows={5} />
+						<SelectionFormatBar textareaRef={composeTextareaRef} value={text} onChange={setText} />
+					</span>
+				</label>
+				<label class="stack" style={{ "--gap": "var(--space-3xs)" }}>
+					<span>{t("chat.list.attachmentsLabel")}</span>
+					<input type="file" multiple onChange={handleFilesSelected} disabled={busy} />
+				</label>
+				{(tray.items.length > 0 || tray.errors.length > 0) && (
+					<AttachmentTray items={tray.items} errors={tray.errors} onRemove={tray.remove} layout={tray.layout} onLayoutChange={tray.setLayout} />
+				)}
+				<button
+					type="submit"
+					disabled={busy || (text.length === 0 && tray.items.length === 0) || tray.items.some((item) => item.error)}
+				>
+					<IconSend /> {t("common.send")}
+				</button>
+			</form>
+		</Screen>
+	);
+}
+
+export default function Chat() {
+	const ownerPubkey = currentUser.value.id;
+	const privKey = privKeySig.value;
+	const dbKey = dbKeySig.value;
+
+	const [composing, setComposing] = useState(false);
+
+	useEffect(() => {
+		ensureConnected(ownerPubkey, privKey, dbKey)
+			.then(() => refreshLiveProfileSubscription(ownerPubkey))
+			.catch(() => notifyConnectionTrouble());
+	}, [ownerPubkey]);
+
+	if (place.value.kind === "chat" && place.value.id) {
+		return <ChatWindow ownerPubkey={ownerPubkey} privKey={privKey} dbKey={dbKey} contactPubkey={place.value.id} />;
+	}
+
+	if (composing) {
+		return (
+			<ComposeMessage
+				ownerPubkey={ownerPubkey}
+				privKey={privKey}
+				dbKey={dbKey}
+				onCancel={() => setComposing(false)}
+				onSent={(recipient) => {
+					setComposing(false);
+					openChat(recipient);
+				}}
+			/>
+		);
+	}
+
+	return <ChatList ownerPubkey={ownerPubkey} privKey={privKey} dbKey={dbKey} onCompose={() => setComposing(true)} />;
+}

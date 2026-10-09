@@ -1,0 +1,67 @@
+import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
+import { concatBytes } from "@noble/ciphers/utils.js";
+import { sanitizeReplyTo } from "./reply.js";
+import { isControlText } from "./control-markers.js";
+
+export const KIND_MESSAGE_MIRROR = 446;
+
+function encodeBase64(bytes) {
+	return btoa(String.fromCharCode.apply(null, bytes));
+}
+
+function decodeBase64(str) {
+	return Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
+}
+
+export function encryptMirrorPayload(payload, mirrorKey) {
+	const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+	const nonce = crypto.getRandomValues(new Uint8Array(12));
+	const ciphertext = chacha20poly1305(mirrorKey, nonce).encrypt(plaintext);
+	return encodeBase64(concatBytes(nonce, ciphertext));
+}
+
+export function decryptMirrorPayload(base64Content, mirrorKey) {
+	const blob = decodeBase64(base64Content);
+	const nonce = blob.subarray(0, 12);
+	const ciphertext = blob.subarray(12);
+	const plaintext = chacha20poly1305(mirrorKey, nonce).decrypt(ciphertext);
+	return JSON.parse(new TextDecoder().decode(plaintext));
+}
+
+export function buildMirrorEvent(payload, mirrorKey, groupIdHex, createdAt) {
+	return {
+		kind: KIND_MESSAGE_MIRROR,
+		tags: [["h", groupIdHex]],
+		content: encryptMirrorPayload(payload, mirrorKey),
+		created_at: createdAt,
+	};
+}
+
+// AC-AT-06 (TECH.md §15) — извлечено из transport.js's syncMirroredHistory (было
+// инлайн внутри onBatch, непроверяемо юнит-тестом отдельно от WebSocket-обвязки).
+// sentAt/attachments включаются, ТОЛЬКО если реально присутствуют в payload (этап 29
+// — обратная совместимость со старыми зеркалами, не undefined-значения). Этап B
+// (MEDIA-SPEC.md §3.7) — attachment (единственное число, старый формат) нормализуется
+// в attachments-массив: зеркало может доставить историческое событие с другого
+// устройства владельца, которое ещё не обновилось до этого этапа.
+export function buildMirroredMessageRow(ownerPubkey, payload, eventId) {
+	const extra = {};
+	if (payload.sentAt !== undefined) extra.sentAt = payload.sentAt;
+	const attachments = payload.attachments ?? (payload.attachment ? [payload.attachment] : undefined);
+	if (attachments !== undefined) extra.attachments = attachments;
+	// Ответ на сообщение и признак «служебное» должны доехать до остальных устройств той же личности.
+	const replyTo = sanitizeReplyTo(payload.replyTo);
+	if (replyTo) extra.replyTo = replyTo;
+	if (isControlText(payload.text)) extra.ctl = true;
+	return {
+		ownerPubkey,
+		chatId: payload.contactPubkey,
+		lamportTs: payload.lamportTs,
+		senderPubkey: payload.senderPubkey,
+		id: eventId,
+		text: payload.text,
+		status: "sent",
+		msgId: payload.msgId,
+		...extra,
+	};
+}

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="ru">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+
+		<!-- Основное: то, что видит поиск в выдаче -->
+		<title>Уголок — уютный мессенджер, который живёт на вашем сервере</title>
+		<meta name="description" content="Децентрализованный мессенджер на протоколе Nostr: личные чаты со сквозным шифрованием, каналы, файлы и звонки. Без номера телефона, на собственном сервере." />
+		<link rel="canonical" href="https://ugolok.tech/" />
+		<meta name="robots" content="index, follow, max-image-preview:large" />
+
+		<!-- Цвета интерфейса браузера (адресная строка на Android, заголовок PWA) -->
+		<meta name="color-scheme" content="dark light" />
+		<meta name="theme-color" content="#1E1916" media="(prefers-color-scheme: dark)" />
+		<meta name="theme-color" content="#FBEEDC" media="(prefers-color-scheme: light)" />
+
+		<!-- Иконки -->
+		<link rel="icon" href="/favicon.ico" sizes="48x48" />
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<link rel="icon" href="/favicon-96x96.png" type="image/png" sizes="96x96" />
+		<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+		<link rel="manifest" href="/site.webmanifest" />
+		<meta name="application-name" content="Уголок" />
+		<meta name="apple-mobile-web-app-title" content="Уголок" />
+
+		<!-- Карточка при пересылке ссылки (Telegram, VK, WhatsApp, Mastodon, Nostr-клиенты) -->
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="Уголок" />
+		<meta property="og:locale" content="ru_RU" />
+		<meta property="og:url" content="https://ugolok.tech/" />
+		<meta property="og:title" content="Уголок — уютный мессенджер, который живёт на вашем сервере" />
+		<meta property="og:description" content="Личные чаты со сквозным шифрованием, каналы, файлы и звонки на протоколе Nostr. Без номера телефона и без центрального владельца." />
+		<meta property="og:image" content="https://ugolok.tech/og-image.png" />
+		<meta property="og:image:type" content="image/png" />
+		<meta property="og:image:width" content="1200" />
+		<meta property="og:image:height" content="630" />
+		<meta property="og:image:alt" content="Знак Уголка — облачко сообщения с сердцем в остром углу — и надпись «Уютный мессенджер, который живёт на вашем сервере»" />
+		<meta name="twitter:card" content="summary_large_image" />
+
+		<!-- Подтверждение прав в вебмастерах: вставь свои коды или удали строки
+		<meta name="yandex-verification" content="КОД_ИЗ_ЯНДЕКС_ВЕБМАСТЕРА">
+		<meta name="google-site-verification" content="КОД_ИЗ_SEARCH_CONSOLE">
+		-->
+
+		<!-- Разметка schema.org: кто мы, что за сайт, где исходники -->
+		<script type="application/ld+json">
+		{
+			"@context": "https://schema.org",
+			"@graph": [
+				{
+					"@type": "Organization",
+					"@id": "https://ugolok.tech/#org",
+					"name": "Уголок",
+					"alternateName": "Ugolok",
+					"url": "https://ugolok.tech/",
+					"logo": {
+						"@type": "ImageObject",
+						"url": "https://ugolok.tech/web-app-manifest-512x512.png",
+						"width": 512,
+						"height": 512
+					},
+					"sameAs": ["https://github.com/devugolok/ugolok"]
+				},
+				{
+					"@type": "WebSite",
+					"@id": "https://ugolok.tech/#website",
+					"url": "https://ugolok.tech/",
+					"name": "Уголок",
+					"alternateName": "Ugolok",
+					"inLanguage": "ru-RU",
+					"publisher": { "@id": "https://ugolok.tech/#org" }
+				},
+				{
+					"@type": "WebPage",
+					"@id": "https://ugolok.tech/#webpage",
+					"url": "https://ugolok.tech/",
+					"name": "Уголок — уютный мессенджер, который живёт на вашем сервере",
+					"description": "Децентрализованный мессенджер на протоколе Nostr: личные чаты со сквозным шифрованием, каналы, файлы и звонки. Без номера телефона, на собственном сервере.",
+					"inLanguage": "ru-RU",
+					"isPartOf": { "@id": "https://ugolok.tech/#website" },
+					"about": { "@id": "https://ugolok.tech/#code" },
+					"primaryImageOfPage": {
+						"@type": "ImageObject",
+						"url": "https://ugolok.tech/og-image.png",
+						"width": 1200,
+						"height": 630
+					}
+				},
+				{
+					"@type": "SoftwareSourceCode",
+					"@id": "https://ugolok.tech/#code",
+					"name": "Уголок",
+					"description": "Клиент и серверный набор (реле Nostr, файловое хранилище Blossom, TURN для звонков) для развёртывания собственного мессенджера.",
+					"codeRepository": "https://github.com/devugolok/ugolok",
+					"programmingLanguage": "JavaScript",
+					"runtimePlatform": "Web, Node.js, Docker",
+					"keywords": "мессенджер, Nostr, сквозное шифрование, децентрализация, self-hosted, приватность",
+					"author": { "@id": "https://ugolok.tech/#org" }
+				}
+			]
+		}
+		</script>
+	</head>
+	<body>
+		<!-- Текст для краулеров без JS и для первых секунд загрузки (раньше — заглушка
+		     noscript с H1 и «Загрузка…»: Яндекс и роботы без JS видели пустую страницу).
+		     main.jsx делает root.replaceChildren() перед render — приложение этот блок
+		     целиком убирает. Тексты — из description и справки «О проекте», ссылки —
+		     на статические страницы справки (scripts/help-pages.mjs). -->
+		<div id="app">
+			<style>
+				.boot-intro{max-width:40rem;margin:0 auto;padding:2rem 1rem;color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.6}
+				.boot-intro h1{font-size:1.8rem;line-height:1.25}
+				.boot-intro .boot-status{color:var(--muted)}
+				.boot-intro a{color:var(--accent)}
+			</style>
+			<main class="boot-intro">
+				<p class="boot-status" role="status">Загрузка…</p>
+				<h1>Уголок — уютный мессенджер, который живёт на вашем сервере</h1>
+				<p>Децентрализованный мессенджер на протоколе Nostr: личные чаты со сквозным шифрованием, каналы, файлы и звонки. Без номера телефона, на собственном сервере.</p>
+				<h2>Что умеет Уголок</h2>
+				<ul>
+					<li>Личные сообщения со сквозным шифрованием и защитой от чтения задним числом.</li>
+					<li>Каналы — что-то среднее между постом в соцсети и групповым чатом.</li>
+					<li>Файлы и вложения в собственном шифрованном хранилище.</li>
+					<li>Голосовые звонки и «Быстрая связь» — временная комната для текста и голоса без регистрации.</li>
+					<li>Интерфейс на 12 языках.</li>
+					<li>Свой сервер: Уголок можно развернуть у себя и полностью управлять своими данными.</li>
+				</ul>
+				<h2>Справка</h2>
+				<ul>
+					<li><a href="/help/ru/o-proekte.html">О проекте</a></li>
+					<li><a href="/help/ru/kontakty-i-kanaly.html">Контакты и каналы</a></li>
+					<li><a href="/help/ru/privatnost.html">Приватность</a></li>
+					<li><a href="/help/ru/stek.html">Технологии</a></li>
+					<li><a href="/help/ru/iskhodnyj-kod.html">Исходный код</a></li>
+					<li><a href="/help/ru/podderzhka.html">Поддержка и контакты</a></li>
+				</ul>
+				<p lang="en"><a href="/help/en/o-proekte.html" hreflang="en">About Ugolok in English</a> · <a href="/help/es/o-proekte.html" hreflang="es" lang="es">Español</a> · <a href="/help/de/o-proekte.html" hreflang="de" lang="de">Deutsch</a> · <a href="/help/fr/o-proekte.html" hreflang="fr" lang="fr">Français</a> · <a href="/help/pt/o-proekte.html" hreflang="pt" lang="pt">Português</a> · <a href="/help/it/o-proekte.html" hreflang="it" lang="it">Italiano</a> · <a href="/help/nl/o-proekte.html" hreflang="nl" lang="nl">Nederlands</a> · <a href="/help/pl/o-proekte.html" hreflang="pl" lang="pl">Polski</a> · <a href="/help/tr/o-proekte.html" hreflang="tr" lang="tr">Türkçe</a> · <a href="/help/ja/o-proekte.html" hreflang="ja" lang="ja">日本語</a> · <a href="/help/zh/o-proekte.html" hreflang="zh" lang="zh">中文</a></p>
+			</main>
+		</div>
+		<script type="module" src="/src/main.jsx"></script>
+	</body>
+</html>

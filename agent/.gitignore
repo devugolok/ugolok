@@ -1,0 +1,7 @@
+/state/
+/bin/
+ugolok-agent
+compose/rendered/
+compose/relay-src/
+compose/blossom-src/
+compose/blossom.env

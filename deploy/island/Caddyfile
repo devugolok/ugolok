@@ -1,0 +1,4 @@
+# Caddy переехал в deploy/caddy/.
+# Прод-сайты: deploy/caddy/prod.caddy
+# Тест: deploy/caddy/test.caddy
+# Корень с import: deploy/caddy/Caddyfile

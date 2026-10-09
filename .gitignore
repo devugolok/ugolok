@@ -1,0 +1,51 @@
+# Служебные заметки разработки живут в ветке process.
+# .gitignore не защищает от merge process → main: при слиянии файлы вернутся.
+CLAUDE.md
+worker.sh
+.claude/
+PROCESS-DOCS/
+
+node_modules/
+target/
+dist/
+dist-capacitor/
+native/desktop/src-tauri/dist-tauri/
+native/desktop/src-tauri/gen/
+.DS_Store
+*.log
+.env
+.env.*
+dist-updates/
+deploy/.env
+# Боевой coturn.conf с паролем живёт только на VPS / в ~/.config/ugolok-ops.
+deploy/island/coturn.conf
+# TURN_STATIC_AUTH_SECRET для turncreds-server (этап 6, TZ-cicd-hardening) — тот же принцип.
+deploy/island/turncreds.env
+# Э-PUSH (TZ-PUSH-ANDROID.md, П1) — секреты моста/ntfy, тот же принцип.
+deploy/island/push-bridge.env
+deploy/island/push-bridge-plugin.env
+# ntfy auth.db/cache.db создаются в volume /var/lib/ugolok/ntfy на VPS, не в git —
+# перечислено здесь на случай локального docker compose up с bind-mount вместо volume.
+deploy/island/ntfy-data/
+
+# server/strfry — тестовый relay, поднимается локально по docs в server/README.md.
+# Исходники/сборка/БД не версионируются (бинарь платформозависим, БД — локальные
+# тестовые данные, может расти неограниченно). strfry.conf и наши скрипты — версионируются.
+server/strfry/strfry-src/
+server/strfry/strfry-db/
+server/strfry/strfry.log
+
+# server/blossom — тестовый Blossom-сервер (sebdeveloper6952/blossom-server, Go),
+# тот же принцип, что server/strfry выше: исходники/сборка/БД не версионируются,
+# config.yml/setup.sh/run.sh — версионируются.
+server/blossom/blossom-src/
+server/blossom/blossom-db/
+server/blossom/blossom-db.old-*/
+server/blossom/blossom-src.old-*/
+server/blossom/blossom.env
+server/blossom/blossom.log
+
+# server/coturn — локальный TURN/STUN (Homebrew coturn). Конфиг и скрипты
+# версионируются, pid/лог — нет.
+server/coturn/turnserver.pid
+server/coturn/coturn.logserver/strfry/mirror-state.json

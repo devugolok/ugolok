@@ -1,0 +1,208 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mediaSession, openMedia, mediaNext, mediaPrev, mediaGoTo, mediaToggle, mediaMinimize, mediaRestore, mediaEnded, closeMedia, setRepeat, setAutoplay } from "../src/ui/signals/media.js";
+import { callState } from "../src/ui/signals/call.js";
+
+function ref(digest, mime = "image/jpeg") {
+	return { digest, key: new Uint8Array([1]), mime, name: digest, size: 100, sourceKind: "attachment", sourceMeta: {} };
+}
+
+function resetCallState() {
+	callState.value = { name: "IDLE", role: null, sessionId: null, peerPubkey: null, polite: null, restartCount: 0, reason: null };
+}
+
+test("openMedia: заполняет mediaSession по transition('open', ...)", () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a"), ref("b", "video/mp4")], position: 0 });
+	assert.equal(mediaSession.value.cls, "image");
+	assert.equal(mediaSession.value.position, 0);
+	assert.equal(mediaSession.value.display, "full");
+	assert.equal(mediaSession.value.play, "playing");
+	assert.ok(mediaSession.value.playlist);
+	closeMedia();
+});
+
+test("mediaNext/mediaPrev: перемещают позицию в пределах класса (та же семантика, что media-machine.test.js)", () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a"), ref("b"), ref("c")], position: 0 });
+	mediaNext();
+	assert.equal(mediaSession.value.position, 1);
+	mediaPrev();
+	assert.equal(mediaSession.value.position, 0);
+	closeMedia();
+});
+
+test("mediaGoTo: этап 4 — прыжок на произвольную позицию через 'open', без пересборки плейлиста", () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a"), ref("b"), ref("c"), ref("d", "video/mp4")], position: 0 });
+	const playlistBefore = mediaSession.value.playlist;
+	mediaGoTo(2);
+	assert.equal(mediaSession.value.position, 2);
+	assert.equal(mediaSession.value.cls, "image");
+	assert.equal(mediaSession.value.display, "full");
+	assert.equal(mediaSession.value.play, "playing");
+	assert.equal(mediaSession.value.playlist, playlistBefore, "playlistRef — тот же объект (===), openMedia/buildPlaylist не вызывались повторно");
+	closeMedia();
+});
+
+test("mediaGoTo: корректно переключает класс (jump с image на video той же сессии)", () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a"), ref("b", "video/mp4")], position: 0 });
+	mediaGoTo(1);
+	assert.equal(mediaSession.value.position, 1);
+	assert.equal(mediaSession.value.cls, "video");
+	closeMedia();
+});
+
+test("mediaToggle/mediaMinimize/mediaRestore: дергают ожидаемые поля состояния", () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a", "video/mp4")], position: 0 });
+	assert.equal(mediaSession.value.play, "playing");
+	mediaToggle();
+	assert.equal(mediaSession.value.play, "paused");
+	mediaMinimize();
+	assert.equal(mediaSession.value.display, "mini");
+	mediaRestore();
+	assert.equal(mediaSession.value.display, "full");
+	closeMedia();
+});
+
+test("mediaEnded: переходит к следующему треку своего класса (doEnded уже покрыт этапом A, здесь — проверка что событие реально доходит до автомата)", () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a", "audio/mpeg"), ref("b", "audio/mpeg")], position: 0 });
+	mediaEnded();
+	assert.equal(mediaSession.value.position, 1);
+	assert.equal(mediaSession.value.play, "playing");
+	mediaEnded();
+	assert.equal(mediaSession.value.position, 1, "на последнем треке класса — остаться на месте");
+	assert.equal(mediaSession.value.play, "paused");
+	closeMedia();
+});
+
+test("closeMedia: обнуляет mediaSession", () => {
+	resetCallState();
+	openMedia({ refs: [ref("a")], position: 0 });
+	closeMedia();
+	assert.equal(mediaSession.value, null);
+});
+
+test("И5: изображение не сворачивается (minimize — no-op для cls=image, media-machine.js уже гарантирует, здесь — сквозная проверка через сигнал)", () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a", "image/png")], position: 0 });
+	mediaMinimize();
+	assert.equal(mediaSession.value.display, "full");
+	closeMedia();
+});
+
+test("callState edge-detection: последовательность OUTGOING_RINGING->CONNECTING->CONNECTED даёт РОВНО один переход play playing->suspended (один callStart, не три)", async () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a", "video/mp4")], position: 0 });
+	assert.equal(mediaSession.value.play, "playing");
+
+	callState.value = { ...callState.value, name: "OUTGOING_RINGING" };
+	await Promise.resolve();
+	assert.equal(mediaSession.value.play, "suspended", "первый переход в активное состояние звонка обязан приостановить проигрывание");
+
+	callState.value = { ...callState.value, name: "CONNECTING" };
+	await Promise.resolve();
+	callState.value = { ...callState.value, name: "CONNECTED" };
+	await Promise.resolve();
+	assert.equal(mediaSession.value.play, "suspended", "внутренние переходы FSM звонка не должны заново дёргать callStart (и так уже suspended)");
+	assert.equal(mediaSession.value.callActive, true);
+
+	callState.value = { ...callState.value, name: "ENDED" };
+	await Promise.resolve();
+	assert.equal(mediaSession.value.play, "paused", "callEnd переводит suspended -> paused (решение §1.4 — не возобновлять)");
+	assert.equal(mediaSession.value.callActive, false);
+
+	resetCallState();
+	await Promise.resolve();
+	closeMedia();
+});
+
+// Этап 10 — repeat/autoplay живут вне сигнала (mediaPrefs, модульная
+// переменная в signals/media.js), но должны доходить до mediaSession через
+// payload события "open" и переживать закрытие/повторное открытие сессии
+// (localStorage недоступен в node --test — loadMediaPrefs() тихо падает в
+// try/catch на defaults при импорте модуля, здесь проверяется только
+// В-ПАМЯТИ поведение mediaPrefs, что и есть предмет теста: setRepeat/
+// setAutoplay обязаны сохраняться между сессиями ДАЖЕ без storage).
+
+test("openMedia по умолчанию: repeat='off', autoplay=true (setRepeat/setAutoplay сброшены в начале теста)", () => {
+	resetCallState();
+	closeMedia();
+	setRepeat("off");
+	setAutoplay(true);
+	closeMedia();
+	openMedia({ refs: [ref("a"), ref("b")], position: 0 });
+	assert.equal(mediaSession.value.repeat, "off");
+	assert.equal(mediaSession.value.autoplay, true);
+	closeMedia();
+});
+
+test("setRepeat: меняет repeat текущей сессии и переживает close+повторный openMedia", () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a"), ref("b")], position: 0 });
+	setRepeat("all");
+	assert.equal(mediaSession.value.repeat, "all");
+	closeMedia();
+	openMedia({ refs: [ref("a"), ref("b")], position: 0 });
+	assert.equal(mediaSession.value.repeat, "all", "режим повтора обязан пережить закрытие просмотрщика");
+	setRepeat("off"); // сброс для последующих тестов
+	closeMedia();
+});
+
+test("setRepeat: игнорирует недопустимое значение, не трогает mediaPrefs", () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a")], position: 0 });
+	setRepeat("bogus");
+	assert.equal(mediaSession.value.repeat, "off");
+	closeMedia();
+});
+
+test("setAutoplay(false): следующий openMedia открывает на паузе (не playing)", () => {
+	resetCallState();
+	closeMedia();
+	setAutoplay(false);
+	openMedia({ refs: [ref("a", "video/mp4")], position: 0 });
+	assert.equal(mediaSession.value.autoplay, false);
+	assert.equal(mediaSession.value.play, "paused");
+	setAutoplay(true); // сброс для последующих тестов
+	closeMedia();
+});
+
+test("mediaGoTo: НЕ сбрасывает repeat/autoplay текущей сессии (переиспользует mediaPrefs, не значения по умолчанию)", () => {
+	resetCallState();
+	closeMedia();
+	setRepeat("one");
+	openMedia({ refs: [ref("a"), ref("b"), ref("c")], position: 0 });
+	assert.equal(mediaSession.value.repeat, "one");
+	mediaGoTo(2);
+	assert.equal(mediaSession.value.repeat, "one", "прыжок по миниатюре не обязан сбрасывать режим повтора");
+	setRepeat("off"); // сброс для последующих тестов
+	closeMedia();
+});
+
+test("И2: play нельзя перевести в playing, пока callActive=true (toggle — no-op)", async () => {
+	resetCallState();
+	closeMedia();
+	openMedia({ refs: [ref("a", "video/mp4")], position: 0 });
+	callState.value = { ...callState.value, name: "CONNECTED" };
+	await Promise.resolve();
+	assert.equal(mediaSession.value.play, "suspended");
+	mediaToggle();
+	assert.equal(mediaSession.value.play, "suspended", "toggle во время активного звонка не должен включать playing (И2)");
+	resetCallState();
+	await Promise.resolve();
+	closeMedia();
+});

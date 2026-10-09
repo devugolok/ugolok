@@ -1,0 +1,609 @@
+import { useState, useEffect } from "preact/hooks";
+import { getOrDownloadMessageAttachment } from "../../domain/files/content-cache.js";
+import { getMemoryCachedUrl, putMemoryCachedAttachment } from "../attachment-memory-cache.js";
+import { resolveImagePreviewUrl } from "../../domain/media/image-preview.js";
+import { resolveAttachmentPreviewUrl } from "../../domain/media/attachment-preview-resolver.js";
+import { getPreviewUrl } from "../../domain/media/plaintext-cache.js";
+import { currentUser, dbKeySig, privKeySig } from "../signals/auth.js";
+import { publish } from "../signals/transport.js";
+import { initFiles, createFileEntry, treeState, getFileKeyFor } from "../signals/files.js";
+import { prepareOwnCopy } from "../../domain/files/copy-attachment.js";
+import { PreconditionError } from "../../domain/files/ops.js";
+import { setMediaOrigin } from "../signals/media-origin.js";
+import { getPlatform } from "../../platform/index.js";
+import IconMusicNote from "../icons/music-note.jsx";
+import IconVideoCamera from "../icons/video-camera.jsx";
+import IconFileText from "../icons/file-text.jsx";
+import IconImage from "../icons/image-icon.jsx";
+import IconFolder from "../icons/folder.jsx";
+import IconCheck from "../icons/check.jsx";
+import IconDownload from "../icons/download.jsx";
+import { pushToast } from "../signals/toasts.js";
+import { t, tPlural, errorMessage } from "../signals/i18n.js";
+import { truncateFileName } from "./bubble-attachment-plan.js";
+import { reservedBoxStyle } from "./attachment-box.js";
+import { uploadTarget } from "../../domain/files/servers.js";
+import MediaProgress from "./media/media-progress.jsx";
+
+// Этап 53 И7 7.4 — дескриптор вложения больше не несёт СВОЙ blossomUrl (старая
+// форма, на сервер, куда конкретно загружено); manifestDigest/fileKey читаются
+// через content.js — тот же ОДИН сконфигурированный Blossom-сервер, что везде
+// в разделе "Файлы" (files.jsx/file-player.jsx), не per-вложение URL.
+
+function base64ToBytes(str) {
+	return Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
+}
+
+export function formatFileSize(bytes) {
+	if (bytes < 1024) return t("attachment.units.bytes", { count: bytes });
+	if (bytes < 1024 * 1024) return t("attachment.units.kb", { count: (bytes / 1024).toFixed(1) });
+	return t("attachment.units.mb", { count: (bytes / (1024 * 1024)).toFixed(1) });
+}
+
+// voice (F-AT-08) — имя вложения не годится для отображения: оно приходит
+// зашифрованным ВНУТРИ сообщения от отправителя буквальным текстом на ЕГО
+// языке (см. chat.jsx buildOutgoingAttachment) — получатель не может
+// "перевести" чужие данные через свой t(). Вместо этого для голосовых вообще
+// игнорируем attachment.name и показываем нейтральную подпись на языке
+// ПРОСМАТРИВАЮЩЕГО, определяя голосовое по флагу attachment.voice (уже
+// существующее булево поле, не зависит от текста).
+function attachmentDisplayName(attachment) {
+	return attachment.voice ? t("chat.voiceMessageName") : attachment.name;
+}
+
+const FILE_TYPE_ICONS = { image: IconImage, video: IconVideoCamera, audio: IconMusicNote, file: IconFileText };
+
+// MEDIA-OVERLAY-UI.md, этап 3.3 — точка клика (rect на момент СИНХРОННОГО
+// вызова обработчика, до открытия сессии) кладётся в media-origin.js, чтобы
+// media-overlay.jsx мог анимировать "разлёт из миниатюры". Общий helper —
+// единственное место захвата для всех трёх кликабельных превью ниже, три
+// экранных пути (chat.jsx/channel.jsx/channel-chat.jsx openAttachment) правятся
+// этим одним изменением.
+export function openWithOrigin(e, attachment, onOpen) {
+	setMediaOrigin(e.currentTarget.getBoundingClientRect());
+	onOpen(attachment);
+}
+
+// Картинка — EAGER-загрузка+расшифровка (не может быть иначе: E2E-шифрование не даёт
+// частичной/потоковой подгрузки, нужно скачать и расшифровать ПОЛНОСТЬЮ, прежде чем
+// показать хоть пиксель) — но картинки ожидаются видимыми сразу в бабле (в отличие от
+// видео/аудио, см. VideoAttachment/AudioAttachment). Клик -> onOpen(attachment) —
+// Этап F (DESIGN.md "Этап F, F1/F2") передаёт scope (сбор playlist поста/чата/канала)
+// вызывающей стороне целиком; сам компонент про scope не знает (было — строил
+// openMedia сам, одиночный элемент, без next/prev — Этап D6). Инлайновое превью в
+// бабле продолжает идти через attachment-memory-cache.js (эта функция), fullscreen-
+// вид — через media-url.js/resourceOwner (media-overlay.jsx) — два независимых кэша
+// одной и той же картинки, сознательная избыточность этого прохода, не оптимизировано.
+// reserve — MEDIA-PERF-TZ-6.md §8.1: резервировать ли место по width/height
+// вложения. Плитки в пузыре (bubble-attachment-cluster.jsx) уже имеют
+// фиксированный aspect-ratio из CSS раскладки, им резерв не нужен (reserve=false);
+// одиночная картинка вне кластера (пост, канал, «Файлы») до этого схлопывалась
+// в строку с волчком и потом прыгала до размера картинки.
+export function ImageAttachment({ attachment, onOpen, reserve = true }) {
+	const [url, setUrl] = useState(() => getPreviewUrl(attachment.manifestDigest) ?? null);
+	const [progress, setProgress] = useState({ phase: "loading", percent: null });
+	const [error, setError] = useState("");
+	const [retryTick, setRetryTick] = useState(0);
+
+	useEffect(() => {
+		const cached = getPreviewUrl(attachment.manifestDigest);
+		if (cached) {
+			setUrl(cached);
+			setError("");
+			return;
+		}
+		let cancelled = false;
+		setUrl(null);
+		setError("");
+		setProgress({ phase: "loading", percent: null });
+
+		// MEDIA-PERF-TZ-5.md §3 — previewDigest, если есть, резолвится ОТДЕЛЬНЫМ
+		// маленьким blob'ом, оригинал (manifestDigest) в этой ветке не трогаем
+		// вовсе (resolveAttachmentPreviewUrl не знает о нём по построению). Отказ
+		// (сеть/сервер) — молча падаем на путь оригинала ниже, не показываем
+		// ошибку сразу: превью необязательно, оригинал остаётся источником истины.
+		// Вложение БЕЗ previewDigest (старые сообщения) идёт СРАЗУ на путь
+		// оригинала — ровно как до этой задачи, ни строки поведения не меняется.
+		async function load() {
+			if (attachment.previewDigest) {
+				const previewUrl = await resolveAttachmentPreviewUrl(attachment, { serverUrl: uploadTarget() });
+				if (cancelled) return;
+				if (previewUrl) {
+					setUrl(previewUrl);
+					return;
+				}
+			}
+			try {
+				const raster = await resolveImagePreviewUrl(
+					attachment.manifestDigest,
+					attachment.mime,
+					// trace (MEDIA-PERF-TZ.md §3.2) — пробрасывается ЧЕРЕЗ уже
+					// существующий options-мешок (content-cache.js -> attachments.js
+					// -> content.js форвардят объект без изменений), net/decrypt
+					// лягут в ту же строку, что raster в image-preview.js.
+					// onDownload (MEDIA-PERF-TZ-6.md §8.2) уходит в getRange как
+					// onProgress через тот же options-мешок — процент из фактических
+					// байтов, без выдумывания.
+					(trace, onDownload) => getOrDownloadMessageAttachment(currentUser.value.id, dbKeySig.value, attachment, { serverUrl: uploadTarget(), trace, onProgress: onDownload }),
+					undefined,
+					(p) => {
+						if (!cancelled) setProgress(p);
+					},
+				);
+				if (!cancelled) setUrl(raster.url);
+			} catch (err) {
+				if (!cancelled) setError(errorMessage(err));
+			}
+		}
+		load();
+
+		return () => {
+			cancelled = true;
+		};
+	}, [attachment, retryTick]);
+
+	if (error) {
+		return (
+			<p role="alert" class="stack" style={{ "--gap": "var(--space-2xs)", color: "var(--bad)" }}>
+				<span>{t("attachment.imageLoadError", { error })}</span>
+				<button type="button" class="btn--ghost" onClick={() => setRetryTick((n) => n + 1)}>
+					{t("attachment.retry")}
+				</button>
+			</p>
+		);
+	}
+	const boxStyle = reserve ? reservedBoxStyle(attachment) : undefined;
+	if (!url) {
+		// Этап + полоса + МБ/скорость/остаток (media-progress.jsx); место под картинку резервируется как раньше.
+		return (
+			<div style={{ display: "grid", placeItems: "center", ...boxStyle }}>
+				<MediaProgress progress={progress} expectedBytes={attachment.size} />
+			</div>
+		);
+	}
+	const img = (
+		<img
+			class="attachment-image"
+			src={url}
+			alt={attachment.name || ""}
+			onClick={(e) => openWithOrigin(e, attachment, onOpen)}
+			style={boxStyle ? { width: "100%", height: "100%", objectFit: "cover" } : undefined}
+		/>
+	);
+	return boxStyle ? <div style={{ ...boxStyle, display: "block" }}>{img}</div> : img;
+}
+
+// Голосовое (voice/voiceInline, F-AT-08) — БЕЗ изменений Этапом F: остаётся eager
+// (уже дёшево — voiceInline ≤32КБ декодируется прямо из base64 в payload, без сети
+// вовсе; не voiceInline — тот же потолок 50 МБ, что раньше). Голосовые НЕ в
+// плейлисте (MEDIA-SPEC.md §1.4) — не через onOpen/openMedia, свой нативный
+// <audio controls> инлайн, как всегда. Обычное (не голосовое) аудио — Этап F,
+// F1: превью БЕЗ сети вовсе (DESIGN.md "Этап F, F1"), клик -> onOpen(attachment),
+// потоковый плеер уже есть с Этапа D (SW-мост, Range).
+function AudioAttachment({ attachment, onOpen }) {
+	const [url, setUrl] = useState(() => (attachment.voiceInline ? null : (getMemoryCachedUrl(attachment.manifestDigest) ?? null)));
+	const [error, setError] = useState("");
+
+	useEffect(() => {
+		if (!attachment.voice) return;
+		// voiceInline (≤32КБ, F-AT-08) — decode из payload КАЖДЫЙ раз, в сеть/кэш
+		// не ходит вовсе, кэшировать нечего (уже дёшево, ObjectURL живёт своим
+		// unmount'ом, как раньше).
+		if (attachment.voiceInline) {
+			const objectUrl = URL.createObjectURL(new Blob([base64ToBytes(attachment.voiceInline)], { type: attachment.mime || "audio/webm" }));
+			setUrl(objectUrl);
+			return () => URL.revokeObjectURL(objectUrl);
+		}
+		const memUrl = getMemoryCachedUrl(attachment.manifestDigest);
+		if (memUrl) {
+			setUrl(memUrl);
+			return;
+		}
+		let cancelled = false;
+		getOrDownloadMessageAttachment(currentUser.value.id, dbKeySig.value, attachment, { serverUrl: uploadTarget() })
+			.then((bytes) => {
+				if (cancelled) return;
+				setUrl(putMemoryCachedAttachment(attachment.manifestDigest, bytes, attachment.mime));
+			})
+			.catch((err) => {
+				if (!cancelled) setError(errorMessage(err));
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [attachment]);
+
+	if (!attachment.voice) {
+		return <AudioPreview attachment={attachment} onOpen={onOpen} />;
+	}
+
+	if (error) {
+		return (
+			<p role="alert" style={{ color: "var(--bad)" }}>
+				{t("attachment.audioLoadError", { error })}
+			</p>
+		);
+	}
+	if (!url) {
+		return (
+			<p class="row" style={{ "--gap": "var(--space-s)", "--align": "center", color: "var(--muted)" }}>
+				<span class="spinner" aria-hidden="true" /> {t("attachment.loadingVoice")}
+			</p>
+		);
+	}
+	return (
+		<div class="audio-shell">
+			<audio controls src={url} />
+		</div>
+	);
+}
+
+// Видео — Этап F, F1 (DESIGN.md "Этап F, F1"): БЕЗ сети вовсе — превью
+// (иконка+имя+размер, тот же паттерн, что FileAttachment), клик -> onOpen.
+// Было: eager-загрузка ПОЛНОГО файла в бабл (item 9, ранняя стадия проекта) —
+// заменено на потоковый путь, уже готовый с Этапа D (SW-мост, Range, не вся
+// загрузка сразу — устраняет и саму причину "какофонии" от нескольких autoPlay-
+// видео разом, раз ни одно видео больше не грузится/не рендерится инлайн).
+function VideoAttachment({ attachment, onOpen }) {
+	return <MediaPreview attachment={attachment} Icon={IconVideoCamera} onOpen={onOpen} ariaLabelKey="attachment.openVideoAria" />;
+}
+
+// Волна для .audio — декоративный фиксированный узор (буквально та же
+// последовательность высот, что в самом макете PROCESS-DOCS/REDESIGN/
+// ugolok-final.html) — НЕ анализ реального файла: Этап F, F1 запрещает
+// сеть на превью, а амплитуду не получить без скачивания+расшифровки.
+export const AUDIO_WAVE_HEIGHTS = [8, 15, 22, 11, 26, 17, 7, 20, 13, 24, 9, 18, 27, 12, 6, 19, 14, 23, 10, 16, 25, 11, 21, 8, 17, 13, 26, 9, 20, 15, 22, 7, 18, 24, 12, 19];
+
+// Компактный превью не-голосового аудио — макет .audio/.wave. audio__len
+// показывает РАЗМЕР файла (formatFileSize), не длительность — по той же
+// причине, что волна декоративна (см. выше): длительность узнаётся только
+// у реального <audio>-элемента, а тот появляется лишь после клика (открытие
+// в MediaOverlay), не в этом превью.
+function AudioPreview({ attachment, onOpen }) {
+	return (
+		<button
+			type="button"
+			class="audio bar"
+			style={{ "--gap": "var(--space-xs)" }}
+			onClick={(e) => openWithOrigin(e, attachment, onOpen)}
+			aria-label={t("attachment.openAudioAria", { name: attachment.name })}
+		>
+			<span class="audio__play" aria-hidden="true">
+				▶
+			</span>
+			<span class="wave" aria-hidden="true">
+				{AUDIO_WAVE_HEIGHTS.map((h, i) => (
+					<i key={i} style={{ height: `${h}px` }} />
+				))}
+			</span>
+			<span class="audio__len">{formatFileSize(attachment.size)}</span>
+		</button>
+	);
+}
+
+// Общий вид превью для видео (Этап F, F1) — иконка+имя+размер, кликabельная
+// строка, тот же визуальный паттерн, что FileAttachment, но <button>, не <p>
+// (интерактивность). Без состояния загрузки — синхронно, name/size/mime уже
+// есть в дескрипторе, сеть не нужна для самого превью. (Аудио — своя ветка,
+// AudioPreview выше, с макетным .audio/.wave вместо этой строки.)
+function MediaPreview({ attachment, Icon, onOpen, ariaLabelKey }) {
+	return (
+		<button
+			type="button"
+			class="btn--ghost media-attachment-preview row"
+			style={{ "--gap": "var(--space-s)", "--align": "center" }}
+			onClick={(e) => openWithOrigin(e, attachment, onOpen)}
+			aria-label={t(ariaLabelKey, { name: attachment.name })}
+		>
+			<Icon aria-hidden="true" />
+			<span>
+				{attachment.name} ({formatFileSize(attachment.size)})
+			</span>
+		</button>
+	);
+}
+
+// Файл (не image/video/audio — документ/таблица) — статичная строка с
+// иконкой/именем/размером; скачивание теперь единой ссылкой "Скачать" в
+// футере сообщения (message-bubble.jsx, item 10), не отдельной кнопкой тут.
+function FileAttachment({ attachment }) {
+	const Icon = FILE_TYPE_ICONS.file;
+	return (
+		<p class="row" style={{ "--gap": "var(--space-s)", "--align": "center" }}>
+			<Icon aria-hidden="true" />
+			<span>
+				{attachment.name} ({formatFileSize(attachment.size)})
+			</span>
+		</p>
+	);
+}
+
+// Редизайн интерфейса, этап 9 (CONTRACTS.md) — "Сохранить к себе": вложение
+// ленты (сообщение/чат канала/пост/комментарий) -> узел хранилища, с полем
+// origin ({kind, id}), которое раньше было ВСЕГДА null (отчёт E2). initFiles
+// — идемпотентный бутстрап (тот же вызов, что file-picker.jsx) — вложение
+// может открываться, даже если "Файлы"/FilePicker ни разу не открывались за
+// сессию, без него createFileEntry писал бы под cachedOwnerPubkey===null.
+export function AttachmentSaveButton({ attachment, origin, menu = false, iconOnly = false }) {
+	const [status, setStatus] = useState("idle"); // idle | busy | done | error
+	const [error, setError] = useState("");
+
+	// ТЗ-03, раздел 7: «Сохранить к себе» — настоящая копия (своя заливка, своя квота), а не
+	// ссылка на блоб автора. Повторное нажатие дублей не плодит: журнал помнит, что этот
+	// исходный манифест уже копировали.
+	async function handleSave() {
+		setStatus("busy");
+		setError("");
+		try {
+			const ownerPubkey = currentUser.value.id;
+			await initFiles(ownerPubkey, privKeySig.value, publish);
+			const name = attachmentDisplayName(attachment) || attachment.name;
+			const res = await prepareOwnCopy({ attachment, name, serverUrl: uploadTarget(), privateKey: privKeySig.value });
+
+			if (res.kind === "existing") {
+				// Копия уже залита. Если в «Файлах» есть живой узел на неё — ничего не делаем;
+				// если узел удалили — заводим заново на ТОТ ЖЕ блоб (ключ хранится у нас).
+				const hasNode = [...treeState.value.nodes.values()].some((n) => n.kind === "file" && n.blob === res.manifestDigest && n.par?.value !== "$trash");
+				if (!hasNode) {
+					const key = await getFileKeyFor(res.manifestDigest);
+					if (!key) throw new Error(t("attachment.copyKeyMissing"));
+					const op = await createFileEntry(name, res.manifestDigest, key, origin, attachment.mime);
+					if (op instanceof PreconditionError) {
+						setError(errorMessage(op));
+						setStatus("error");
+						return;
+					}
+				}
+				setStatus("done");
+				return;
+			}
+
+			const op = await createFileEntry(res.name, res.manifestDigest, res.fileKey, origin, res.mime ?? attachment.mime);
+			if (op instanceof PreconditionError) {
+				setError(errorMessage(op));
+				setStatus("error");
+				return;
+			}
+			setStatus("done");
+		} catch (err) {
+			setError(errorMessage(err));
+			setStatus("error");
+		}
+	}
+
+	const saveLabel = menu
+		? t("attachment.saveNamed", { name: truncateFileName(attachmentDisplayName(attachment)) })
+		: t("attachment.saveToStorage");
+
+	// Полноэкранный просмотр: кнопка-иконка, итог — тостом (места для строки статуса нет).
+	useEffect(() => {
+		if (!iconOnly) return;
+		if (status === "done") pushToast({ title: t("attachment.savedToStorage") });
+		if (status === "error" && error) pushToast({ title: error });
+	}, [status]);
+
+	if (iconOnly) {
+		const label = status === "busy" ? t("attachment.saving") : t("attachment.saveToStorage");
+		return (
+			<button type="button" class="media-overlay-btn" onClick={handleSave} disabled={status === "busy" || status === "done"} aria-label={label} title={label}>
+				{status === "done" ? <IconCheck aria-hidden="true" /> : <IconFolder aria-hidden="true" />}
+			</button>
+		);
+	}
+
+	if (status === "done") {
+		return (
+			<p role="status" style={{ color: "var(--muted)" }}>
+				{t("attachment.savedToStorage")}
+			</p>
+		);
+	}
+
+	return (
+		<>
+			<button type="button" class={menu ? undefined : "btn--ghost"} onClick={handleSave} disabled={status === "busy"}>
+				<IconFolder aria-hidden="true" /> {status === "busy" ? t("attachment.saving") : saveLabel}
+			</button>
+			{error && (
+				<small role="alert" style={{ color: "var(--bad)" }}>
+					{error}
+				</small>
+			)}
+		</>
+	);
+}
+
+// Плитка сетки-подборки — макет .tile. Картинка — фоновая миниатюра ТОЛЬКО
+// если уже в attachment-memory-cache.js (тот же приём "без сети", что
+// плёнка кадров media-overlay.jsx, CONTRACTS.md довесок Этапа 4:
+// getMemoryCachedUrl, undefined -> без миниатюры, без спиннера, без
+// сетевого запроса). Остальные типы (и картинка без готовой миниатюры) —
+// иконка+размер, та же причина отсутствия "длительности", что у AudioPreview.
+// HEADERS (CONTRACTS.md §HEADERS), этап 1 — экспортирован: тот же
+// компонент рендерит плитку в браузере вложений (chat.jsx/channel.jsx/
+// channel-chat.jsx), не только CollectionGrid поста.
+export function CollectionTile({ attachment, onOpen }) {
+	const Icon = FILE_TYPE_ICONS[attachment.type] || IconFileText;
+	const digest = attachment.manifestDigest;
+	// Превью хранится ВМЕСТЕ со своим digest и сверяется с текущим вложением
+	// синхронно: Preact переиспользует экземпляр плитки, когда в списке меняется
+	// вложение (смена фильтра типа), и без сверки остаётся чужое превью
+	// (у видео/аудио всплывали картинки предыдущего списка).
+	const [thumb, setThumb] = useState(() => ({
+		digest,
+		url:
+			getPreviewUrl(digest) ||
+			getMemoryCachedUrl(digest) ||
+			(attachment.previewDigest ? getMemoryCachedUrl(attachment.previewDigest) : null) ||
+			null,
+	}));
+	const thumbUrl = thumb.digest === digest ? thumb.url : null;
+
+	useEffect(() => {
+		if (thumbUrl) return;
+		if (attachment.type !== "image" && attachment.type !== "video") return;
+		let cancelled = false;
+		(async () => {
+			if (attachment.previewDigest) {
+				const previewUrl = await resolveAttachmentPreviewUrl(attachment, { serverUrl: uploadTarget() });
+				if (!cancelled && previewUrl) {
+					setThumb({ digest, url: previewUrl });
+					return;
+				}
+			}
+			if (attachment.type !== "image") return;
+			try {
+				const raster = await resolveImagePreviewUrl(
+					attachment.manifestDigest,
+					attachment.mime,
+					(trace) =>
+						getOrDownloadMessageAttachment(currentUser.value.id, dbKeySig.value, attachment, {
+							serverUrl: uploadTarget(),
+							trace,
+						}),
+				);
+				if (!cancelled && raster?.url) setThumb({ digest, url: raster.url });
+			} catch {
+				// плитка остаётся иконкой+размером
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	}, [attachment, thumbUrl, digest]);
+
+	return (
+		<button
+			type="button"
+			class="tile"
+			style={thumbUrl ? { backgroundImage: `url(${thumbUrl})`, backgroundSize: "cover", backgroundPosition: "center" } : undefined}
+			onClick={(e) => openWithOrigin(e, attachment, onOpen)}
+			aria-label={t("attachment.openAria", { name: attachmentDisplayName(attachment) })}
+		>
+			{!thumbUrl && (
+				<>
+					<Icon aria-hidden="true" />
+					<span>{formatFileSize(attachment.size)}</span>
+				</>
+			)}
+		</button>
+	);
+}
+
+// Сетка-подборка — макет .mgrid/.tile, для kind==="collection" (record-kind.js
+// — пост без текста и с несколькими вложениями). Плиток больше COLLECTION_TILE_LIMIT
+// — последняя плитка "ещё N" (не кликабельна, просто счётчик, div — не button,
+// не сравнивать с .tile--more:hover других плиток). "Слушать подряд"/аналог
+// НЕ добавлен: MediaButtons (post-card.jsx footer) уже даёт ровно это действие
+// через onOpenMediaClass — тот же playlist для класса вложений поста, дублировать
+// вторую кнопку с тем же эффектом было бы лишней сущностью, не довеском к макету.
+const COLLECTION_TILE_LIMIT = 5;
+
+export function CollectionGrid({ attachments, onOpen }) {
+	const visible = attachments.slice(0, COLLECTION_TILE_LIMIT);
+	const overflow = attachments.length - visible.length;
+	const totalSize = attachments.reduce((sum, a) => sum + (a.size || 0), 0);
+	return (
+		<div class="stack" style={{ "--gap": "var(--space-2xs)" }}>
+			<div class="mgrid">
+				{visible.map((a, i) => (
+					<CollectionTile key={i} attachment={a} onOpen={onOpen} />
+				))}
+				{overflow > 0 && (
+					<div class="tile tile--more" aria-hidden="true">
+						{t("postCard.collectionMoreTile", { count: overflow })}
+					</div>
+				)}
+			</div>
+			<p class="collection-summary">{tPlural("postCard.collectionSummary", attachments.length, { size: formatFileSize(totalSize) })}</p>
+		</div>
+	);
+}
+
+// Диспетчер по attachment.type (F-AT-02) — единственная точка входа для рендера
+// вложения, переиспользуется message-bubble.jsx; задел на будущий раздел "мои файлы"
+// (тот же дескриптор, та же отрисовка по типу).
+// origin ({kind, id}, этап 9) — опционален, обратная совместимость: БЕЗ него
+// рендер не меняется ни на пиксель (существующие вызовы без origin не
+// оборачиваются). С origin — контент оборачивается, снизу добавляется кнопка
+// "Сохранить к себе". Решение Claude (сужение охвата): gutter-миниатюра поста
+// (post-card.jsx, этап 2 — узкая 6rem-колонка) origin намеренно НЕ получает —
+// вторая строка с кнопкой физически не влезает без слома вёрстки; та же
+// картинка как обычное inline-вложение кнопку получает.
+export default function AttachmentView({ attachment, onOpen, origin }) {
+	const content =
+		attachment.type === "image" ? (
+			<ImageAttachment attachment={attachment} onOpen={onOpen} />
+		) : attachment.type === "video" ? (
+			<VideoAttachment attachment={attachment} onOpen={onOpen} />
+		) : attachment.type === "audio" ? (
+			<AudioAttachment attachment={attachment} onOpen={onOpen} />
+		) : (
+			<FileAttachment attachment={attachment} />
+		);
+
+	if (!origin) return content;
+
+	return (
+		<div class="stack" style={{ "--gap": "var(--space-3xs)" }}>
+			{content}
+			<AttachmentSaveButton attachment={attachment} origin={origin} />
+		</div>
+	);
+}
+
+// Единая ссылка "Скачать" (item 10, "ко всем вложениям... перед 'Удалить'") —
+// используется message-bubble.jsx в футере сообщения, ДО кнопки "Удалить".
+// Формат: {{иконка типа}} Скачать {{имя}} ({{размер}}). voiceInline (F-AT-08,
+// ≤32КБ) декодируется прямо из payload, без сети — как AudioAttachment.
+export function AttachmentDownloadLink({ attachment, menu = false, iconOnly = false }) {
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState("");
+	const Icon = FILE_TYPE_ICONS[attachment.type] || IconFileText;
+	const displayName = attachmentDisplayName(attachment);
+	const label = menu
+		? t("attachment.downloadNamed", { name: truncateFileName(displayName) })
+		: `${t("attachment.download")} ${displayName} (${formatFileSize(attachment.size)})`;
+
+	async function handleDownload() {
+		setBusy(true);
+		setError("");
+		try {
+			const bytes = attachment.voiceInline
+				? base64ToBytes(attachment.voiceInline)
+				: await getOrDownloadMessageAttachment(currentUser.value.id, dbKeySig.value, attachment, { serverUrl: uploadTarget() });
+			await getPlatform().files.saveAs({
+				name: attachmentDisplayName(attachment) || "file",
+				mime: attachment.mime,
+				data: bytes,
+			});
+		} catch (err) {
+			setError(errorMessage(err));
+			if (iconOnly) pushToast({ title: errorMessage(err) });
+		} finally {
+			setBusy(false);
+		}
+	}
+
+	if (iconOnly) {
+		const iconLabel = busy ? t("attachment.downloading") : t("attachment.download");
+		return (
+			<button type="button" class="media-overlay-btn" onClick={handleDownload} disabled={busy} aria-label={iconLabel} title={iconLabel}>
+				<IconDownload aria-hidden="true" />
+			</button>
+		);
+	}
+
+	return (
+		<>
+			<button type="button" onClick={handleDownload} disabled={busy}>
+				<Icon /> {busy ? t("attachment.downloading") : label}
+			</button>
+			{error && (
+				<small role="alert" style={{ color: "var(--bad)" }}>
+					{error}
+				</small>
+			)}
+		</>
+	);
+}

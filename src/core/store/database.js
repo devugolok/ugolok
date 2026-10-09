@@ -1,0 +1,478 @@
+import Dexie from "dexie";
+import { logInfo } from "../diag/boot-log.js";
+
+export const db = new Dexie("ugolok");
+db.version(1).stores({
+  events: "++seq, id, [pubkey+kind], created_at, *flatTags",
+  contacts: "[owner+pubkey], owner",
+  blockedContacts: "[owner+pubkey], owner",
+  groups: "[owner+id], owner",
+  groupMembers: "[groupId+pubkey], groupId",
+  permissions: "[owner+subject+resource], owner, subject, resource",
+  effectivePerms: "[owner+subject+resource], owner, subject, resource",
+  channelKeys: "[channelId+keyVersion], channelId",
+  channelKeyMeta: "channelId",
+  channelTopics: "channelId",
+  commentAllowlists: "[channelId+keyVersion], channelId",
+  messages: "++seq, [chatId+lamportTs+senderPubkey+id], chatId, id, status, deleted",
+  channels: "id, owner",
+  posts: "id, [channelId+created_at], channelId, author, keyVersion, deleted",
+  comments: "[authorPubkey+commentId], postId, parentId, keyVersion, deleted",
+  attachments: "sha256, messageId, type, mime",
+  keystore: "id",
+  clock: "id",
+  syncState: "relay",
+  chatSyncState: "chatId",
+  channelSyncState: "channelId",
+  outbox: "++seq, eventId, status, retryCount",
+  inboxRequests: "id, senderPubkey, created_at",
+  deletions: "targetId, deleterPubkey, created_at",
+  mlsGroups: "groupId"
+});
+
+// Этап 24 — аддитивно: две новые таблицы, остальные наследуются из version(1)
+// без изменений (стандартная Dexie-семантика, миграция данных не нужна — проект
+// ещё не в проде, только пустые локальные базы).
+db.version(2).stores({
+  ownKeyPackage: "id",
+  contactRequests: "[owner+senderPubkey], owner"
+});
+
+// Этап 25 — аддитивно: две новые таблицы (multi-device) + messages переопределена
+// целиком (Dexie требует полный список индексов таблицы при изменении хотя бы
+// одного) — добавлен unique-индекс [chatId+msgId] для идемпотентного upsertMessage
+// (DESIGN.md, "Этап 25", раздел 3). НЕ [chatId+lamportTs+senderPubkey] — легитимная
+// коллизия при multi-device (два устройства одной identity тикают один и тот же
+// lamport-момент), тайбрейк по id уже покрыт существующим тестом этапа 24. Старый
+// неуникальный индекс [chatId+lamportTs+senderPubkey+id] остаётся для сортировки
+// getChatHistory, данных к миграции нет (пустые локальные базы).
+db.version(3).stores({
+  deviceIdentity: "id",
+  knownDevices: "[ownerPubkey+deviceId], ownerPubkey",
+  messages:
+    "++seq, &[chatId+msgId], [chatId+lamportTs+senderPubkey+id], chatId, id, status, deleted",
+  inboxRequests: "[owner+senderPubkey], owner, senderPubkey, createdAt"
+});
+
+// НАЙДЕНО РЕАЛЬНЫМ ИСПОЛЬЗОВАНИЕМ (не адверсарным тестом) — критический пробел
+// этапов 13/24/25/26: ownKeyPackage/mlsGroups/messages/chatSyncState НИКОГДА не были
+// owner-scoped, в отличие от contacts/blockedContacts/groups/contactRequests/inboxRequests/
+// knownDevices (owner-scoped с самого начала). Молчаливое допущение "одна identity = одно
+// устройство = одна БД" не учитывало, что мультиаккаунт на одном устройстве (уже поддержан
+// с этапа 11) означает НЕСКОЛЬКО identities, делящих ОДНУ IndexedDB (один origin). На практике:
+// ownKeyPackage хранил ОДНУ запись "self" на всё устройство — второй локальный аккаунт молча
+// получал MLS-credential ПЕРВОГО, что ts-mls закономерно отвергает как "участник уже в группе"
+// (тот же класс конфликта, что этап 25 исправил для credential identity:deviceId, только
+// теперь между РАЗНЫМИ identity на одном устройстве, не между устройствами одной identity).
+// mlsGroups/messages/chatSyncState были голыми (без owner) — второй локальный аккаунт видел
+// ЧУЖИЕ переписки. deviceIdentity НЕ owner-scoped НАМЕРЕННО и остаётся так — deviceId это
+// метка ФИЗИЧЕСКОГО устройства, общая для всех identity на нём (credential = identity:deviceId
+// уже различает identity через первую часть, коллизии deviceId сам по себе не создаёт).
+db.version(4).stores({
+  ownKeyPackage: "ownerPubkey",
+  mlsGroups: "[ownerPubkey+groupId], ownerPubkey",
+  messages:
+    "++seq, &[ownerPubkey+chatId+msgId], [ownerPubkey+chatId+lamportTs+senderPubkey+id], [ownerPubkey+chatId], id, status, deleted",
+  chatSyncState: "[ownerPubkey+chatId], ownerPubkey"
+});
+
+// Этап 30 — найдено рассуждением ДО кода (не постфактум), тот же класс пробела, что уже
+// исправлен для messages/mlsGroups/ownKeyPackage/chatSyncState (этапы 25-27): channels/
+// channelKeys/channelKeyMeta/commentAllowlists в version(1) были объявлены БЕЗ ownerPubkey
+// в индексе — при мультиаккаунте на одном устройстве второй локальный аккаунт видел бы
+// чужие каналы/ключи. Эти таблицы НИКОГДА не использовались кодом (объявлены с этапа 1,
+// не заполнялись) — переопределение без риска миграции данных. channelTopics (была
+// отдельной таблицей channelId→topic) сворачивается в поле channels.channelTopic —
+// тот же список получаем через channels.where('ownerPubkey'), обратный запрос
+// (topic→канал) — через индекс channelTopic той же таблицы, отдельная таблица не нужна.
+db.version(5).stores({
+  channels: "[ownerPubkey+id], ownerPubkey, channelTopic",
+  channelKeys: "[ownerPubkey+channelId+keyVersion], [ownerPubkey+channelId]",
+  channelKeyMeta: "[ownerPubkey+channelId]",
+  commentAllowlists: "[ownerPubkey+channelId+keyVersion], [ownerPubkey+channelId]",
+  channelTopics: null
+});
+
+// Этап 31 — тот же класс пробела, найденный рассуждением ДО кода (не постфактум), что
+// этап 30 уже исправил для channels/channelKeys/...: posts/comments в version(1) были
+// объявлены БЕЗ ownerPubkey. Никогда не использовались кодом — переопределение без
+// риска миграции.
+db.version(6).stores({
+  posts: "[ownerPubkey+id], [ownerPubkey+channelId+createdAt], deleted",
+  comments: "[ownerPubkey+id], [ownerPubkey+postId], deleted"
+});
+
+// Этап 32 — общий чат канала. Owner-scoped с рождения (паттерн из этапов 25-31
+// уже усвоен — не откладываем правильную схему на потом).
+db.version(7).stores({
+  channelMessages: "[ownerPubkey+id], [ownerPubkey+channelId+createdAt]"
+});
+
+// Этап 33 — модерация. channelReaders: аддитивная правка контракта этапа 30
+// (createChannel теперь персистит, кому realistically выдан VIEW — нужно banMember,
+// чтобы переиздать ключ ВСЕМ оставшимся). channelMessages не меняет primary key
+// (аддитивно) — получает поле deleted (не индексируется, фильтрация в памяти,
+// тот же паттерн, что posts/comments).
+db.version(8).stores({
+  channelReaders: "[ownerPubkey+channelId+readerPubkey], [ownerPubkey+channelId]",
+  channelReports: "[ownerPubkey+id], [ownerPubkey+channelId], viewed",
+  channelIgnores: "[ownerPubkey+channelId+ignoredPubkey], [ownerPubkey+channelId]",
+  bannedMembers: "[ownerPubkey+channelId+pubkey], [ownerPubkey+channelId]"
+});
+
+// Этап 34 — настройки (kind 30072, F-SY-03). Один blob на аккаунт, голый
+// ownerPubkey — сам по себе owner-scoped (тот же приём, что deviceIdentity/
+// ownKeyPackage), составной ключ не нужен, т.к. это не коллекция записей.
+db.version(9).stores({
+  uiSettings: "ownerPubkey"
+});
+
+// Этап 36 — отзыв VIEW при выходе из группы (DESIGN.md). Снимок "какие группы
+// дали каналу видимость при создании" — без этого removeGroupMemberAction не
+// может узнать, на какие каналы вообще влияет выход из группы. Обратный индекс
+// [ownerPubkey+groupId] — findChannelIdsByVisibilityGroup без полного скана channels.
+db.version(10).stores({
+  channelVisibilityGroups: "[ownerPubkey+channelId+groupId], [ownerPubkey+channelId], [ownerPubkey+groupId]"
+});
+
+// НАЙДЕНО РЕАЛЬНЫМ ИСПОЛЬЗОВАНИЕМ (пользователь, мультиаккаунт в разных вкладках
+// одного браузера/origin) — clock (Lamport-часы, этап 19) НИКОГДА не был owner-scoped,
+// в отличие от messages/mlsGroups/ownKeyPackage/chatSyncState (db.version(4)) и
+// channels/channelKeys/... (db.version(5)/(6)) — тот же класс пробела, пропущенный
+// при том рефакторинге. Один глобальный {id:'lamport'} на ВСЁ устройство означал, что
+// computeInitialLamportValue() (lamport.js) искала max(lamportTs) по messages ВСЕХ
+// локальных аккаунтов разом, а persistLamportValue() писала в ОДНУ строку — второй
+// локальный аккаунт (второй пользователь переписки, открытый в соседней вкладке)
+// перетирал тики первого, путая сортировку истории чата (то же следствие, что
+// найденный на этапе 19-25 баг "часы не синхронизировались", только через другой
+// канал — общий персист вместо отсутствующего receive()).
+db.version(11).stores({
+  clock: "[ownerPubkey+id]"
+});
+
+// Этап 43 — переопределяет мёртвую attachments (объявлена с этапа 1, никогда не
+// читалась/писалась) под owner-scoped кэш расшифрованных вложений (CONTRACTS.md/DESIGN.md).
+db.version(12).stores({
+  attachments: "[ownerPubkey+sha256], ownerPubkey, lastAccessedAt"
+});
+
+// Этап 46 — раздел "Обзор" (CONTRACTS.md/DESIGN.md). discoverySettings — локальное
+// зеркало СВОЕГО выбора видимости (тот же бутстрап-принцип, что uiSettings — не ждать
+// relay round-trip, чтобы открыть свой тумблер). discoveryProfiles — локальный кэш ЧУЖИХ
+// discovery-broadcast'ов (kind 30073, публичный по определению — шифровать локальную
+// копию публичного смысла нет). outgoingAcquaintanceRequests — присутствие строки САМО
+// является состоянием "заявка ещё не отменена/не принята" (DESIGN.md, этап 46) —
+// голые pubkey, тот же класс, что groupMembers/contacts на Tier 2, не шифруется.
+db.version(13).stores({
+  discoverySettings: "ownerPubkey",
+  discoveryProfiles: "pubkey",
+  outgoingAcquaintanceRequests: "[owner+targetPubkey], owner"
+});
+
+// Этап 47 — гибкие уведомления (CONTRACTS.md/DESIGN.md). channelSyncState объявлена
+// с этапа 1, ни разу не использована (мёртвый код, класс находки — как attachments
+// до этапа 43) и была БЕЗ owner-scoping (голый channelId — тот же класс пробела, что
+// clock/messages до соответствующих правок). Оживлена под read-tracking каналов —
+// ОДИН общий курсор на канал (posts+comments+chat вместе), не три отдельных.
+db.version(14).stores({
+  channelSyncState: "[ownerPubkey+channelId]"
+});
+
+// Этап 49 — единая таблица состояний контакта/заявки (CONTACTS-FSM.md §3),
+// заменяет structurally contacts/contactRequests/blockedContacts/
+// outgoingAcquaintanceRequests (те остаются в схеме нетронутыми до
+// переноса — миграция отложена до unlock, см. contact-runtime.js,
+// contactRequests зашифрована и нечитаема без dbKey в момент upgrade).
+db.version(15).stores({
+  contactRelationships: "[owner+peer], [owner+state]"
+});
+
+// Этап 50 — фича "Журнал" (персистентный лог уведомлений, CONTACTS-FSM.md
+// §7). `id` — глобально уникальный uuid, отдельный owner-составной ключ не
+// нужен; `owner` и `[owner+createdAt]` — индексы под "список для владельца"
+// и "сортировка по времени" (read — plaintext-флаг, фильтр по нему в памяти,
+// объём таблицы для персонального мессенджера невелик).
+db.version(16).stores({
+  journalEntries: "id, owner, [owner+createdAt]"
+});
+
+// Этап 53 — раздел "Файлы" (CONTRACTS.md, §4.4 TASK.md). Owner-scoped
+// составные ключи — тот же принцип, что contacts/groups/attachments:
+// несколько локальных аккаунтов в одной вкладке не должны видеть чужие
+// узлы/манифесты/миниатюры даже при совпадении digest. files_nodes хранит
+// LWW-регистры РАЗВЁРНУТО по столбцам (par*/name*/origin* отдельно), не
+// вложенным JSON — тот же стиль, что уже принят для похожих плоских
+// табличных состояний в проекте (permissions/effectivePerms). Поля пока НЕ
+// проходят через AC-16 Tier-классификацию (шифрование по полям) — по
+// прямому прецеденту проекта: похожие таблицы (permissions, mlsGroups)
+// тоже добавлялись сначала плейнтекстом, Tier-шифрование — отдельный
+// последующий этап (см. этапы 39-42 в log.md), не смешивается с этой
+// работой.
+db.version(17).stores({
+  files_nodes: "[ownerPubkey+id], ownerPubkey",
+  files_mounts: "[ownerPubkey+nodeId], ownerPubkey",
+  files_manifests: "[ownerPubkey+digest], ownerPubkey",
+  files_blobs: "[ownerPubkey+digest+chunkIndex], ownerPubkey, digest",
+  files_thumbs: "[ownerPubkey+digest], ownerPubkey"
+});
+
+// Найдено при реализации миниатюр (этап 53, И3 3.8): content.putStream
+// возвращает fileKey ОТДЕЛЬНЫМ полем (CONTRACTS.md — "персистентность вне
+// ответственности content.js"), но ничто до сих пор не сохраняло его —
+// после перезагрузки страницы файл стал бы НЕРАСШИФРОВЫВАЕМ НАВСЕГДА
+// (ключ нигде, кроме памяти на момент putStream). files_keys закрывает
+// именно это — ключ владельца на своё же содержимое (не путать с share.js/
+// И6: там обёртки ключа ДЛЯ КОНТАКТОВ, здесь — обычный доступ владельца).
+// Шифруется dbKey перед записью (тот же приём, что domain/attachments/
+// cache.js) — это симметричный ключ РАСШИФРОВКИ файла, самая чувствительная
+// вещь во всём модуле, хранить в открытом виде в IndexedDB недопустимо.
+db.version(18).stores({
+  files_keys: "[ownerPubkey+digest], ownerPubkey"
+});
+
+// Этап 53 И6 (CONTRACTS.md/DESIGN.md) — шаринг и монтирование, по прямому
+// образцу channelKeys/channelKeyMeta/channelReaders (этапы 30/33).
+// files_shares/files_shareKeys — ownerPubkey ЗДЕСЬ означает "владелец
+// ДОЛИ" (тот, кто расшарил); зашифрованы dbKey, тот же приём, что
+// files_keys (subtreeKey — чувствительный симметричный ключ).
+// files_shareGrantees — список текущих читателей доли, НЕ шифруется
+// (тот же прецедент, что channelReaders — "голые" pubkey-списки, не
+// Tier-чувствительны).
+//
+// Сторона ПОЛУЧАТЕЛЯ (mount.js) — ownerPubkey в таблицах ниже означает
+// ПОЛУЧАТЕЛЯ, не владельца доли. files_mounts (уже объявлена, version(17))
+// хранит саму запись Mount (owner/rootId/currentVersion). files_mountKeys —
+// СВОЯ копия ключей по версиям (получатель может накопить НЕСКОЛЬКО версий:
+// revoke ДРУГОГО читателя той же доли ротирует ключ и переиздаёт ЭТОМУ
+// получателю тоже — та же форма, что files_shareKeys на стороне владельца).
+// files_mount_nodes — СОБСТВЕННОЕ CRDT-состояние смонтированной доли
+// (nodeId — узел-ссылка в ЕГО дереве, id — узел ВНУТРИ Mount.state),
+// по прямому образцу files_nodes (та же форма строки, тот же
+// nodeToRow/rowToNode) — НЕ смешивается с files_nodes того же владельца
+// (ALGO.MD §4.3: "исчезает как класс" открытая задача частичной видимости
+// именно потому, что состояния разделены).
+db.version(19).stores({
+  files_shares: "[ownerPubkey+nodeId], ownerPubkey",
+  files_shareKeys: "[ownerPubkey+nodeId+version], [ownerPubkey+nodeId]",
+  files_shareGrantees: "[ownerPubkey+nodeId+granteePubkey], [ownerPubkey+nodeId]",
+  files_mountKeys: "[ownerPubkey+nodeId+version], [ownerPubkey+nodeId]",
+  files_mount_nodes: "[ownerPubkey+mountId+id], [ownerPubkey+mountId]"
+});
+
+// Этап 53 И6, задача 6.6b (CONTRACTS.md) — сайдкар для деривации fileKey
+// файлов ВНУТРИ доли. plaintextDigest едет ТРАНЗИТНО в create-опе
+// (encryptSubtreeOp, уже зашифрованный канал) — tree.js's Node-тип его не
+// хранит (applyOp/mkNode его не читают, контракт И1 не меняется), поэтому
+// получателю нужно ОТДЕЛЬНОЕ место, иначе deriveShareFileKey нечем будет
+// вызвать при следующем открытии приложения. НЕ шифруется — тот же
+// прецедент, что files_mount_nodes (version(19) выше): структурные
+// метаданные дерева доли в этой сессии не шифруются целиком, plaintextDigest
+// без subtreeKey доступа к содержимому не даёт.
+db.version(20).stores({
+  files_mount_file_meta: "[ownerPubkey+mountId+id], [ownerPubkey+mountId]"
+});
+
+// Этап 72 — учёт уже добавленных в MLS-группу устройств КОНТАКТА (не своих
+// собственных — для тех уже есть knownDevices, version(3)), чтобы реактивная
+// досинхронизация (devices.js) не пыталась добавить одно и то же устройство
+// контакта повторно. Не шифруется — тот же прецедент, что knownDevices:
+// KeyPackage и так публичен на relay, локальную копию нечем защищать.
+db.version(21).stores({
+  knownContactDevices: "[ownerPubkey+contactPubkey+deviceId], [ownerPubkey+contactPubkey]"
+});
+
+// Этап 73.3 — И3 (единственный коммиттер): исходящие, накопленные
+// проигравшей стороной, пока коммиттер не создал группу (DESIGN.md,
+// "Этап 73"). Шифруется через toEncryptedRow/PENDING_OUTGOING_MESSAGES_
+// PLAINTEXT_FIELDS — только ownerPubkey/contactPubkey/lamportTs plaintext
+// (составной индекс).
+db.version(22).stores({
+  pendingOutgoingMessages: "[ownerPubkey+contactPubkey+lamportTs], [ownerPubkey+contactPubkey]"
+});
+
+// Этап 74 — T2.3 (RC-3, CONTRACTS.md/DESIGN.md "Этап 74"): межвкладочная
+// дедупликация обработки kind:445 — withGroupLock делает конкурентную
+// обработку БЕЗОПАСНОЙ, но без этого журнала второй processMessage того же
+// wire-события упал бы на replay-защите MLS и засчитался бы decrypt failure.
+// eventId уже публичен на relay — не Tier-чувствителен, но toEncryptedRow
+// применяется по прецеденту всех остальных таблиц (единообразие).
+db.version(23).stores({
+  processedGroupEvents: "[ownerPubkey+eventId], [ownerPubkey+firstSeenAt]"
+});
+
+// Этап 74 — Часть B, T5.2 (CONTRACTS.md/DESIGN.md "Этап 74"): персист
+// профилей контактов (P-2 — раньше жили только в памяти, holodный старт
+// офлайн показывал инициалы). Составной индекс — единственные plaintext-
+// поля (нужны для .get([owner,contact])/.where("ownerPubkey")-гидратации
+// при старте); name/about/picture/createdAt/id — содержательные, шифруются.
+db.version(24).stores({
+  contactProfiles: "[ownerPubkey+contactPubkey], ownerPubkey"
+});
+
+// Редизайн интерфейса, этап 1 (CONTRACTS.md) — признаки записи (dueAt/done/
+// title/linkUrl, dueAt/done открыты). posts переопределена целиком (Dexie
+// требует полный список индексов таблицы при изменении хотя бы одного) —
+// добавлен [ownerPubkey+dueAt] для этапа 4 ("Сегодня": выборка по сроку без
+// полного перебора). Индекс по done не заводится — записей со сроком мало,
+// фильтрация done !== true в памяти.
+db.version(25).stores({
+  posts: "[ownerPubkey+id], [ownerPubkey+channelId+createdAt], deleted, [ownerPubkey+dueAt]"
+});
+
+// Редизайн интерфейса, этап 5 (CONTRACTS.md) — chatActivity: одна строка на
+// [ownerPubkey+chatId], только ПОСЛЕДНЕЕ событие переписки (не история) —
+// свежесть для сортировки боковой панели (этап 10). Индекс "ownerPubkey" —
+// гидратация списка переписок аккаунта, сортировка по lastAt в памяти (тот
+// же приём, что listChatPartners: объём — число переписок, не сообщений).
+db.version(26).stores({
+  chatActivity: "[ownerPubkey+chatId], ownerPubkey"
+});
+
+// Редизайн интерфейса, этап 6 (CONTRACTS.md) — закреплённое (каналы+люди),
+// одна строка на аккаунт, тот же принцип, что uiSettings/discoverySettings.
+db.version(27).stores({
+  pinned: "ownerPubkey"
+});
+
+// ТЗ редизайн канала A — реакции kind 30067. PK: один реактор × одна цель.
+// [ownerPubkey+postId] — страница записи (пост + комментарии этого поста).
+// [ownerPubkey+targetId] — батч ленты (listReactionsForTargets).
+db.version(28).stores({
+  channelReactions: "[ownerPubkey+channelId+targetType+targetId+reactorPubkey], [ownerPubkey+postId], [ownerPubkey+targetId]"
+});
+
+// CHANNEL-V2 часть A4 — watched (0 контакт / 1 "просто увиденный" автор
+// канала) + seenAt: раньше персист в contactProfiles шёл только для
+// контактов, авторы канала не переживали перезагрузку. Новый составной
+// индекс — для trimWatchedProfiles (чистка watched:1 сверх лимита по
+// свежести, watched:0 не трогается никогда). Апгрейд существующих строк —
+// они все контакты (персист раньше и не знал других), watched:0/seenAt:0.
+db.version(29).stores({
+  contactProfiles: "[ownerPubkey+contactPubkey], ownerPubkey, [ownerPubkey+watched+seenAt]"
+}).upgrade(async (tx) => {
+  await tx.table("contactProfiles").toCollection().modify({ watched: 0, seenAt: 0 });
+});
+
+// CONTRACTS.md §DISCOVERY, T4 — visibleUntil (TTL трансляции), не индексируется
+// (фильтр по сроку — в JS, refreshDiscoveryProfiles), поэтому индексы
+// discoverySettings не меняются, .stores({}) пуст. Апгрейд существующих строк —
+// visible:false/visibleUntil:0 (никого не оставляем "видимым бессрочно" молча).
+db.version(30).stores({}).upgrade(async (tx) => {
+  await tx.table("discoverySettings").toCollection().modify({ visible: false, visibleUntil: 0 });
+});
+
+// CONTRACTS.md §DISCOVERY, T9 — discoveryHidden: локальное скрытие карточки
+// после жалобы (по владельцу — не общий бан-лист). discoveryReports: приём
+// жалоб на СТОРОНЕ АДМИНА (snapshot зашифрован, table-fields.js).
+db.version(31).stores({
+  discoveryHidden: "[ownerPubkey+targetPubkey], ownerPubkey",
+  discoveryReports: "[ownerPubkey+id], ownerPubkey"
+});
+
+// CONTRACTS.md §DISCOVERY-REDESIGN, Э4 — discoverySettings получает
+// showBio/showRules. .stores({}) — индексы не меняются (ни одно из новых
+// полей не участвует в индексе), апгрейд — только .modify() существующих
+// строк, тот же приём, что version(30).
+db.version(32).stores({}).upgrade(async (tx) => {
+  await tx.table("discoverySettings").toCollection().modify({ showBio: true, showRules: false });
+});
+
+// Поиск, И2 (CONTRACTS.md §SEARCH) — глобальный обход по времени.
+// Существующие индексы [ownerPubkey+channelId+createdAt] дают порядок
+// ТОЛЬКО внутри канала, а источникам поиска нужен обход всех
+// постов/сообщений канала владельца от свежих к старым (SEARCH-ALGO.md
+// §5.3). Аддитивно: обе таблицы переопределяются целиком (Dexie требует
+// полный список индексов при изменении хотя бы одного) — у posts СОХРАНЁН
+// [ownerPubkey+dueAt] (редизайн интерфейса, этап 1, "Сегодня") — черновик
+// SEARCH-SPEC.md §4 был написан раньше этого индекса и его не учитывал
+// (найдено проверкой П-6, CONTRACTS.md §SEARCH). Задача 3.1 (схема, часть
+// плана И3) выполнена здесь заранее, потому что источники 2.3 не могут
+// быть протестированы без неё — генеральный порядок этапов не нарушен,
+// нарушена только механическая привязка "какой номер задачи в каком файле".
+db.version(33).stores({
+  posts: "[ownerPubkey+id], [ownerPubkey+channelId+createdAt], deleted, [ownerPubkey+dueAt], [ownerPubkey+createdAt]",
+  channelMessages: "[ownerPubkey+id], [ownerPubkey+channelId+createdAt], [ownerPubkey+createdAt]"
+});
+
+// TZ-ORIGIN-MEDIA слой C — ciphertext крипто-чанков. lastAccess для LRU,
+// byteLength в строке (не индекс). Пустую таблицу не пересоздаём.
+db.version(34).stores({
+  files_blobs: "[ownerPubkey+digest+chunkIndex], ownerPubkey, digest, [ownerPubkey+lastAccess]"
+});
+
+// Этап 3 (MESSAGE-DELIVERY-TZ.md, З3.6) — "буфер не должен молча дропать":
+// раньше kind:445, не расшифрованный за UNDECRYPTED_RETRY_TTL_MS (буфер М3,
+// transport.js), просто удалялся из in-memory Map с console.warn — окончательная
+// потеря сообщения была НЕВИДИМА нигде, кроме консоли разработчика. Owner-scoped
+// с рождения (тот же принцип, что все таблицы с этапа 25). Не шифруется —
+// eventId уже публичен на relay (тот же прецедент, что processedGroupEvents,
+// этап 74), groupIdHex не восстанавливает contactPubkey (однонаправленный хэш).
+db.version(35).stores({
+  undeliverable: "[ownerPubkey+eventId], ownerPubkey, [ownerPubkey+droppedAt]"
+});
+
+// Этап 5 (MESSAGE-DELIVERY-TZ.md, З5.7) — "поколение" разговора для пары
+// (owner, contact): переживает удаление mlsGroups-строки (recreateChatConversation
+// стирает её целиком), поэтому не может жить полем ВНУТРИ mlsGroups — нужна
+// отдельная таблица, не привязанная к жизненному циклу самой группы. Голый
+// счётчик, не секрет — тот же прецедент, что knownContactDevices (без шифрования).
+db.version(36).stores({
+  chatGeneration: "[ownerPubkey+contactPubkey]"
+});
+
+// READ-STATUS-AND-LAST-SEEN-TZ: peerCursors — чужой delivered/read курсор
+// (два числа на пару, шифровать нечего). peerPresence — производная
+// lastSeenAt по доказанным событиям контакта, отдельно от chatActivity
+// (та про свежесть переписки для сортировки сайдбара).
+db.version(37).stores({
+  peerCursors: "[ownerPubkey+contactPubkey]",
+  peerPresence: "[ownerPubkey+contactPubkey]",
+});
+
+// ТЗ-03 — журнал загрузок (domain/uploads). uploads — материализованное состояние
+// («что я залил», ключ — hash блоба); uploadBatches — исходные пачки операций (по ним
+// журнал синхронизируется между устройствами и пересобирается); uploadSync — отметка
+// «докуда дочитаны пачки с relay». Имена файлов и цели шифруются dbKey; индексируемые
+// поля (at/group/purpose) остаются открытыми — см. table-fields.js.
+db.version(38).stores({
+  uploads: "[ownerPubkey+hash], ownerPubkey, [ownerPubkey+at], [ownerPubkey+group], [ownerPubkey+purpose]",
+  uploadBatches: "[ownerPubkey+d], ownerPubkey",
+  uploadSync: "ownerPubkey",
+});
+
+// ТЗ-03, доработка: хеши блобов, стёртых с сервера («освободить место»), — по ним «Файлы»
+// помечают узел «удалён с сервера». Материализация из операций freed журнала.
+db.version(39).stores({
+  uploadFreed: "[ownerPubkey+hash], ownerPubkey",
+});
+
+// «Удалить переписку навсегда» (при удалении контакта): надгробие чата. Хранит момент
+// (секунды), до которого всё, что относится к этой паре, считается удалённым: relay при
+// перезапуске передоставляет всю историю (Welcome, сообщения kind 445, зеркало kind 446),
+// и без надгробия удалённая переписка возвращалась бы. Не секрет — тот же прецедент, что
+// chatGeneration (голые числа и публичные ключи, шифровать нечего).
+db.version(40).stores({
+  chatTombstones: "[ownerPubkey+contactPubkey], [ownerPubkey+groupId], ownerPubkey",
+});
+
+// AUDIT-EGOROD E3: вкладка с НОВЫМ кодом хочет поднять версию базы и ждёт, пока
+// старые вкладки отпустят соединение. Штатное поведение Dexie — тихо закрыть
+// соединение, после чего любая операция этой вкладки падает DatabaseClosedError,
+// а сама вкладка выглядит живой. Закрываем явно и просим оболочку (main.jsx)
+// перезагрузиться в безопасный момент; return false — Dexie не должна закрывать
+// второй раз по-своему.
+db.on("versionchange", () => {
+  db.close();
+  if (typeof window !== "undefined" && typeof window.dispatchEvent === "function" && typeof Event === "function") {
+    window.dispatchEvent(new Event("ugolok:db-versionchange"));
+  }
+  return false;
+});
+
+db.on("ready", () => {
+  logInfo(`база данных открыта, схема ${db.verno}`);
+});
+
+export async function resetLocalDatabase() {
+  await db.delete();
+}

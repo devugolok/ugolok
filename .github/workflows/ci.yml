@@ -1,0 +1,24 @@
+# Для приватного GitHub-репозитория сборки (remote `github`) — гоняется только если код туда
+# тоже запушен. origin — Forgejo (git.ugolok.tech), см. .forgejo/workflows/
+# и docs/local-cicd.md. На Forgejo НЕ используется.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev, prod]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      - name: ci-check
+        run: bash scripts/ci-check.sh

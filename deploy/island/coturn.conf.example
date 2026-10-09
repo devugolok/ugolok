@@ -1,0 +1,90 @@
+# prod coturn for ugolok.tech — host network, small UDP range.
+# Скопировать в coturn.conf и подставить пароль. chmod 644:
+# образ coturn/coturn запускается не от root, иначе -c молча падает в no-auth
+# и default 49152-65535 (UFW режет, Chromium: "TURN appears to be broken").
+listening-ip=130.17.31.118
+relay-ip=130.17.31.118
+external-ip=130.17.31.118
+listening-port=3478
+# Диапазон согласован с квотой: устойчивая полная комната 7×6×2 = 84 UDP-аллокации;
+# 261 порт (49160–49420) ≈ 3 таких комнаты. Уже этого порта, не user-quota, —
+# жёсткий потолок UDP-relay. Открыть тот же диапазон в UFW на VPS
+# (network_mode: host, docker порты не пробрасывает).
+min-port=49160
+max-port=49420
+fingerprint
+use-auth-secret
+static-auth-secret=CHANGE_ME
+realm=ugolok.tech
+no-cli
+no-tls
+no-dtls
+no-tlsv1
+no-tlsv1_1
+no-multicast-peers
+no-loopback-peers
+# TURN — это релей: любой держатель кредов (креды публичные — раздаёт
+# turncreds-server без проверки личности, этап 6) может попросить coturn
+# соединить его с чем угодно внутренним. no-loopback-peers покрывает не все
+# формы адреса (например IPv4-mapped ::ffff:127.0.0.1) — явные диапазоны
+# закрывают дыру целиком: облачная metadata (169.254.0.0/16), приватные сети,
+# loopback.
+#
+# Собственный публичный IP в deny + allowed-peer-ip на тот же адрес:
+# без allow CREATE_PERMISSION на relay-адрес собеседника (тот же
+# 130.17.31.118:49xxx) даёт 403 Forbidden IP и TURN↔TURN мёртв — живой
+# звонок Питер↔МО 2026-09-11, три минуты STUN, потом «Переподключение».
+# allowed-peer-ip в coturn перекрывает deny (тот же приём, что у Synapse:
+# client→TURN→TURN→client). Приватные сети/loopback/metadata по-прежнему
+# закрыты. Сервисы на этом IP и так публичны; admin Caddy — unix-сокет.
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=130.17.31.118
+allowed-peer-ip=130.17.31.118
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+# Квота выводится из размера mesh, не назначается отдельно:
+#   user-quota ≥ 2 · (MAX_VOICE_PARTICIPANTS − 1) · (1 + ожидаемые рестарты)
+# MAX_VOICE_PARTICIPANTS = 7 (room-session.js), ожидаемые рестарты = 3
+# (порог recreate PC в call-fsm.js) → 2 · 6 · 4 = 48. Каждое ребро — свой
+# RTCPeerConnection, каждый PC берёт аллокацию на UDP и при turns: ещё на TLS.
+# Старые аллокации при пересоздании PC освобождаются явным pc.close()
+# (media-controller.js doIceRestart); lifetime coturn должен быть короче
+# каденции рестартов, иначе квота снова упрётся в висящие refresh.
+# total-quota = user-quota × MAX_VOICE_PARTICIPANTS × комнат.
+# 48 × 7 × 3 = 1008. Реальный потолок UDP — диапазон портов (~261), не эта цифра;
+# 1008 оставляет запас на TLS-аллокации turns: и пересечение рестартов.
+total-quota=1008
+user-quota=48
+max-bps=1000000
+# AUDIT-EGOROD J1: без verbose — журнал не копит пары IP звонящих и их трафик
+# дольше необходимого для диагностики (включать точечно на время разбора).
+log-file=stdout
+simple-log
+
+# TZ-recovery-policy.md §8 — TURNS (TLS) на 443, задел, НЕ исправление
+# инцидента 2026-09-07 (тот сбой был общим отказом сети, не блокировкой UDP
+# конкретно — turns:443 его бы не предотвратил). Единственный путь для сетей,
+# которые режут именно UDP/нестандартные TCP-порты целиком, оставляя только
+# 443 (гостиничный/корпоративный Wi-Fi, некоторые мобильные операторы) —
+# TURN поверх TLS на порту, который эти сети не трогают.
+#
+# НЕ включено по умолчанию ниже (закомментировано) — раскомментировать
+# и заполнить требует ручной работы, которая не входит в это ТЗ:
+#   1. Порт 443 на этом хосте уже занят Caddy (deploy/island/Caddyfile,
+#      HTTPS для ugolok.tech/test.ugolok.tech) — coturn слушает host-network
+#      (docker-compose.yml), просто добавить tls-listening-port=443 здесь
+#      столкнётся портами с Caddy. Нужен TCP-демультиплексор ПЕРЕД обоими
+#      (например Caddy layer4 app или nginx stream {} с ssl_preread по SNI/
+#      ALPN), которого сейчас нет — coturn.conf сам по себе эту часть не решает.
+#   2. cert-file/pkey-file — реальный сертификат (Caddy сам управляет своим
+#      Let's Encrypt в собственном volume, coturn под user nobody:nogroup
+#      нужен отдельный читаемый экземпляр/копия, обновляемая при ротации).
+# До решения обоих пунктов раскомментирование ниже даст turnserver, который
+# либо не стартует (порт занят), либо стартует и ничего не обслуживает.
+#tls-listening-port=443
+#cert-file=/etc/coturn/fullchain.pem
+#pkey-file=/etc/coturn/privkey.pem

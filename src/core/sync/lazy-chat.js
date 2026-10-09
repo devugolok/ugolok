@@ -1,0 +1,43 @@
+import { db } from '../store/database.js';
+import { parseDeletionText } from '../../domain/messaging/deletions.js';
+import { parseEditText } from '../../domain/messaging/edits.js';
+import { parseCursorText } from '../../domain/messaging/peer-cursors.js';
+import { parseReactionText } from '../../domain/messaging/reactions.js';
+import { normalizeMessageAttachments } from '../../domain/messaging/chat.js';
+import { toEncryptedRow, fromEncryptedRow } from '../store/encrypted-table.js';
+import { CHAT_SYNC_STATE_PLAINTEXT_FIELDS } from '../store/table-fields.js';
+
+export async function loadChatWindow(ownerPubkey, contactPubkey, dbKey, { limit = 100, beforeSeq } = {}) {
+    // [ownerPubkey+chatId] (db.version(4), owner-scoping — см. database.js).
+    const raw = await db.table('messages').where('[ownerPubkey+chatId]').equals([ownerPubkey, contactPubkey]).toArray();
+    let rows = raw.map((r) => normalizeMessageAttachments(fromEncryptedRow(r, dbKey)));
+
+    // DESIGN.md, "Этап 25" раздел 5 (backlog, теперь реализовано этапом 27-довесок-6):
+    // sendMessage создаёт СВОЮ строку messages на КАЖДОЕ kind-445, включая
+    // delete/edit-маркеры — без фильтрации это "сиротская" строка с сырым текстом
+    // маркера в истории чата.
+    rows = rows.filter((m) => parseDeletionText(m.text) === null && parseEditText(m.text) === null && parseCursorText(m.text) === null && parseReactionText(m.text) === null);
+
+    rows.sort((a, b) => {
+        if (a.lamportTs !== b.lamportTs) return a.lamportTs - b.lamportTs;
+        if (a.senderPubkey !== b.senderPubkey) return a.senderPubkey < b.senderPubkey ? -1 : 1;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+
+    let source = rows;
+    if (beforeSeq !== undefined) {
+        let index = source.findIndex(m => m.seq === beforeSeq);
+        if (index !== -1) source = source.slice(0, index);
+    }
+
+    let windowMessages = source.slice(-limit);
+    let hasMore = source.length > limit;
+
+    return { messages: windowMessages, hasMore };
+}
+
+export async function markWindowLoaded(ownerPubkey, dbKey, contactPubkey, oldestLoadedSeq) {
+    const raw = await db.table('chatSyncState').get([ownerPubkey, contactPubkey]);
+    const merged = { ...(raw ? fromEncryptedRow(raw, dbKey) : {}), ownerPubkey, chatId: contactPubkey, oldestLoadedSeq };
+    await db.table('chatSyncState').put(toEncryptedRow(merged, CHAT_SYNC_STATE_PLAINTEXT_FIELDS, dbKey));
+}

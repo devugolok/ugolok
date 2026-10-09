@@ -1,0 +1,663 @@
+// Rooms, этап 4 — mesh-supervisor.js. Тесты до кода (skill п.14). Контракт и
+// design-записка — PROCESS-DOCS/CONTRACTS.md "Rooms — Этап 4" (mesh-supervisor.js).
+// createCallRuntime ИНЪЕЦИРУЕТСЯ фейком (тот же DI-приём, что media-controller.js
+// сам использует) — реальный WebRTC недоступен в node:test, и это ровно граница
+// ответственности mesh-supervisor.js (оркестрация n(n-1)/2 звонковых runtime'ов,
+// не сам WebRTC).
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createMeshSupervisor, DEFAULT_HEALTH_STALE_MS, backoffMs } from "../src/domain/rooms/adapters/mesh-supervisor.js";
+
+const ALICE = "a".repeat(64);
+const BOB = "b".repeat(64);
+const CAROL = "c".repeat(64);
+const DAVE = "d".repeat(64);
+
+function fakeStream(id) {
+	const stream = {
+		id,
+		cloneCount: 0,
+		tracks: [{ stopped: false, stop() { this.stopped = true; } }],
+		getTracks() {
+			return stream.tracks;
+		},
+		clone() {
+			stream.cloneCount += 1;
+			return { id: `${id}-clone-${stream.cloneCount}`, isClone: true, source: id };
+		},
+	};
+	return stream;
+}
+
+// Фейковый createCallRuntime — записывает вызовы, позволяет тесту вручную
+// дёрнуть onStateChange (эмулируя INCOMING_RINGING) и handleIncomingSignal.
+function fakeCallRuntimeFactory() {
+	const instances = []; // {options, placeCalls, hangupCalls, acceptCalls, incomingSignals, state}
+	function createFakeCallRuntime(options) {
+		const instance = {
+			options,
+			placeCalls: [],
+			hangupCalls: 0,
+			acceptCalls: 0,
+			incomingSignals: [],
+			state: { name: "IDLE" },
+		};
+		const runtime = {
+			placeCall: (peerPubkey) => {
+				instance.placeCalls.push(peerPubkey);
+				instance.state = { name: "OUTGOING_RINGING" };
+			},
+			accept: () => {
+				instance.acceptCalls += 1;
+				instance.state = { name: "CONNECTED" };
+			},
+			reject: () => {},
+			hangup: () => {
+				instance.hangupCalls += 1;
+				instance.state = { name: "ENDED" };
+			},
+			handleIncomingSignal: (event) => {
+				instance.incomingSignals.push(event);
+			},
+			getState: () => instance.state,
+			getInboundAudioStats: async () => {
+				if (instance.statsWait) await instance.statsWait;
+				return instance.inboundStats ?? null;
+			},
+			closeNow: () => {
+				instance.closeNowCalls = (instance.closeNowCalls ?? 0) + 1;
+			},
+			dismissEnded: () => {},
+		};
+		instance.runtime = runtime;
+		instances.push(instance);
+		return runtime;
+	}
+	return { createFakeCallRuntime, instances };
+}
+
+function setup({ selfPubkey = ALICE, maxVoice = 5, onRemoteStream, onLocalStream, onTrace, getRelayState, getIceCredsExpiryMs } = {}) {
+	const { createFakeCallRuntime, instances } = fakeCallRuntimeFactory();
+	const stream = fakeStream("shared");
+	const published = [];
+	const supervisor = createMeshSupervisor({
+		selfPubkey,
+		selfPrivKey: new Uint8Array(32),
+		hTopic: "topic".padStart(64, "0"),
+		publish: async (event) => {
+			published.push(event);
+			return { ok: true };
+		},
+		maxVoice,
+		getUserMedia: async () => stream,
+		createCallRuntime: createFakeCallRuntime,
+		...(onRemoteStream ? { onRemoteStream } : {}),
+		...(onLocalStream ? { onLocalStream } : {}),
+		...(onTrace ? { onTrace } : {}),
+		...(getRelayState ? { getRelayState } : {}),
+		...(getIceCredsExpiryMs ? { getIceCredsExpiryMs } : {}),
+	});
+	return { supervisor, instances, stream, published };
+}
+
+function applyRoster(supervisor, pubkeys, now = 0) {
+	supervisor.setDesiredPeers(pubkeys);
+	supervisor.reconcile(now);
+}
+
+test("joinVoice(): захватывает shared stream через инъецированный getUserMedia", async () => {
+	const { supervisor, stream } = setup();
+	await supervisor.joinVoice();
+	assert.equal(stream.cloneCount, 0, "сам joinVoice ещё не создаёт рёбер — клоны появляются только на updateRoster");
+});
+
+test("updateRoster: self с МЕНЬШИМ pubkey -> инициатор -> placeCall вызван на runtime к пиру", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE }); // ALICE < BOB лексикографически
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	assert.equal(instances.length, 1, "ровно одно ребро (единственная пара ALICE-BOB)");
+	assert.deepEqual(instances[0].placeCalls, [BOB]);
+});
+
+test("updateRoster: self с БОЛЬШИМ pubkey -> ответчик -> placeCall НЕ вызывается, ждёт входящий offer", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: BOB }); // BOB > ALICE
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	assert.equal(instances.length, 1);
+	assert.deepEqual(instances[0].placeCalls, [], "ответчик не инициирует");
+});
+
+test("updateRoster: ребро, переданное дочернему runtime для клонирования потока, использует sharedStream.clone(), не сам поток", async () => {
+	const { supervisor, instances, stream } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	const opts = instances[0].options;
+	assert.equal(typeof opts.getUserMediaImpl, "function", "дочернему runtime передан getUserMediaImpl");
+	const cloned = await opts.getUserMediaImpl();
+	assert.ok(cloned.isClone, "дочерний getUserMediaImpl возвращает КЛОН, не сырой sharedStream");
+	assert.equal(stream.cloneCount, 1);
+});
+
+test("updateRoster: рост ростера (третий участник) добавляет ТОЛЬКО новое ребро, существующее не трогает", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+	assert.equal(instances.length, 1);
+	const firstEdgeRuntime = instances[0];
+
+	applyRoster(supervisor, [ALICE, BOB, CAROL]); // ALICE < CAROL — новое ребро ALICE-CAROL, ALICE инициатор
+	assert.equal(instances.length, 2, "добавилось ровно одно новое ребро");
+	assert.equal(firstEdgeRuntime.hangupCalls, 0, "существующее ребро ALICE-BOB не тронуто");
+	assert.deepEqual(instances[1].placeCalls, [CAROL]);
+});
+
+test("updateRoster: уход участника закрывает ребро (hangup), убирает его из карты", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+	assert.equal(instances[0].hangupCalls, 0);
+
+	applyRoster(supervisor, [ALICE]); // BOB вышел из голоса
+	assert.equal(instances[0].hangupCalls, 1);
+
+	const states = supervisor.getEdgeStates();
+	assert.deepEqual(states, [], "ребро к BOB больше не отслеживается");
+});
+
+test("updateRoster ДО joinVoice() — no-op (нет sharedStream, нечем открывать рёбра)", () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	applyRoster(supervisor, [ALICE, BOB]);
+	assert.equal(instances.length, 0);
+});
+
+test("авто-accept: onStateChange('INCOMING_RINGING') на дочернем runtime -> supervisor сам вызывает accept(), без участия пользователя", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: BOB }); // ответчик для ALICE
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	const child = instances[0];
+	assert.equal(child.acceptCalls, 0);
+	child.options.onStateChange("INCOMING_RINGING");
+	await Promise.resolve();
+	assert.equal(child.acceptCalls, 1, "supervisor должен был сам вызвать accept()");
+});
+
+test("onSignal(event): маршрутизирует по event.pubkey к правильному ребру", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	const fakeEvent = { pubkey: BOB, kind: 20075, content: "x", tags: [], id: "e1" };
+	supervisor.onSignal(fakeEvent);
+	assert.deepEqual(instances[0].incomingSignals, [fakeEvent]);
+});
+
+test("onSignal(event): событие от неизвестного (нет такого ребра) senderPubkey -> молча отбрасывается, не бросает", async () => {
+	const { supervisor } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	const fakeEvent = { pubkey: DAVE, kind: 20075, content: "x", tags: [], id: "e2" };
+	assert.doesNotThrow(() => supervisor.onSignal(fakeEvent));
+});
+
+test("leaveVoice(): вешает трубку на всех рёбрах, останавливает shared stream, освобождает карту", async () => {
+	const { supervisor, instances, stream } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB, CAROL]);
+	assert.equal(instances.length, 2);
+
+	supervisor.leaveVoice();
+	assert.equal(instances[0].hangupCalls, 1);
+	assert.equal(instances[1].hangupCalls, 1);
+	assert.equal(stream.tracks[0].stopped, true, "shared stream остановлен ОДИН раз в leaveVoice()");
+	assert.deepEqual(supervisor.getEdgeStates(), []);
+});
+
+test("leaveVoice() затем updateRoster() — no-op, sharedStream уже null (симметрично проверке 'до joinVoice')", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+	supervisor.leaveVoice();
+	instances.length = 0; // сброс счётчика для чистоты следующей проверки
+
+	applyRoster(supervisor, [ALICE, BOB, CAROL]);
+	assert.equal(instances.length, 0, "без активного sharedStream новые рёбра не открываются");
+});
+
+test("getEdgeStates(): отражает peer/role/state для каждого активного ребра", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+	instances[0].state = { name: "CONNECTED" };
+
+	const states = supervisor.getEdgeStates();
+	assert.equal(states.length, 1);
+	assert.equal(states[0].peer, BOB);
+	assert.equal(states[0].role, "initiator");
+	assert.equal(states[0].state, "CONNECTED");
+});
+
+test("maxVoice: защитное усечение — updateRoster с ростером длиннее maxVoice берёт только префикс", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE, maxVoice: 2 });
+	await supervisor.joinVoice();
+	// Ростер длиной 4 при maxVoice=2 -> берётся префикс [ALICE, BOB] -> только одно ребро ALICE-BOB
+	applyRoster(supervisor, [ALICE, BOB, CAROL, DAVE]);
+
+	assert.equal(instances.length, 1, "усечено до maxVoice=2 -> ровно одна пара");
+	assert.deepEqual(instances[0].placeCalls, [BOB]);
+});
+
+test("hTopic/publish/iceServers пробрасываются в каждый дочерний createCallRuntime", async () => {
+	const hTopic = "specific-topic".padStart(64, "0");
+	const { createFakeCallRuntime, instances } = fakeCallRuntimeFactory();
+	const stream = fakeStream("s");
+	const publishFn = async () => ({ ok: true });
+	const supervisor = createMeshSupervisor({
+		selfPubkey: ALICE,
+		selfPrivKey: new Uint8Array(32).fill(9),
+		hTopic,
+		publish: publishFn,
+		maxVoice: 5,
+		getUserMedia: async () => stream,
+		iceServers: [{ urls: "stun:example.org" }],
+		createCallRuntime: createFakeCallRuntime,
+	});
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	const opts = instances[0].options;
+	assert.equal(opts.myPubkey, ALICE);
+	assert.equal(opts.hTopic, hTopic);
+	assert.equal(opts.publish, publishFn);
+	assert.deepEqual(opts.iceServers, [{ urls: "stun:example.org" }]);
+});
+
+test("живая находка №2 (тишина СОХРАНИЛАСЬ после фикса onSignal): дочернему runtime передан onRemoteStream, форвардящий (peer, stream) наверх в инъецированный колбэк супервизора", async () => {
+	const remoteStreamCalls = [];
+	const { supervisor, instances } = setup({ selfPubkey: ALICE, onRemoteStream: (peer, stream) => remoteStreamCalls.push([peer, stream]) });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	assert.equal(typeof instances[0].options.onRemoteStream, "function", "media-controller.js должен получить onRemoteStream, иначе ontrack некуда девать (та же дыра, что уже чинилась в 1:1-звонках, call-overlay.jsx)");
+	const fakeRemote = { id: "remote-track-stream" };
+	instances[0].options.onRemoteStream(fakeRemote);
+	assert.deepEqual(remoteStreamCalls, [[BOB, fakeRemote]], "супервизор форвардит поток С ПРАВИЛЬНЫМ peer, не просто наружу");
+});
+
+test("живая находка №2: закрытие ребра (updateRoster убрал пира) шлёт onRemoteStream(peer, null) — UI обязана остановить/убрать <audio>", async () => {
+	const remoteStreamCalls = [];
+	const { supervisor } = setup({ selfPubkey: ALICE, onRemoteStream: (peer, stream) => remoteStreamCalls.push([peer, stream]) });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+	remoteStreamCalls.length = 0; // интересует только момент закрытия
+	applyRoster(supervisor, [ALICE]); // BOB вышел -> ребро закрывается
+
+	assert.deepEqual(remoteStreamCalls, [[BOB, null]]);
+});
+
+test("Этап 5: joinVoice() вызывает onLocalStream(sharedStream) — сырой поток, не клон (нужен audio-graph.js для собственного уровня/спектрограммы)", async () => {
+	const localStreamCalls = [];
+	const { supervisor, stream } = setup({ onLocalStream: (s) => localStreamCalls.push(s) });
+	await supervisor.joinVoice();
+
+	assert.deepEqual(localStreamCalls, [stream]);
+});
+
+test("Этап 5: leaveVoice() вызывает onLocalStream(null) ДО остановки треков", async () => {
+	const localStreamCalls = [];
+	const { supervisor, stream } = setup({ onLocalStream: (s) => localStreamCalls.push(s) });
+	await supervisor.joinVoice();
+	localStreamCalls.length = 0;
+	supervisor.leaveVoice();
+
+	assert.deepEqual(localStreamCalls, [null]);
+	assert.ok(stream.tracks[0].stopped, "трек всё равно останавливается — onLocalStream(null) не заменяет leaveVoice()'s cleanup");
+});
+
+test("Этап 5: leaveVoice() без предварительного joinVoice() — onLocalStream НЕ вызывается (нечего анонсировать)", () => {
+	const localStreamCalls = [];
+	const { supervisor } = setup({ onLocalStream: (s) => localStreamCalls.push(s) });
+	supervisor.leaveVoice();
+
+	assert.deepEqual(localStreamCalls, []);
+});
+
+// --- Этап 6: адверсарная фаза на границе joinVoice()/leaveVoice() (найденная гонка) ---
+
+function deferred() {
+	let resolve;
+	const promise = new Promise((r) => (resolve = r));
+	return { promise, resolve };
+}
+
+test("Этап 6, живая находка: leaveVoice() вызван ПОКА joinVoice() ещё ждёт getUserMedia — join отменяется, поток немедленно останавливается, sharedStream НЕ присваивается", async () => {
+	const gum = deferred();
+	const localStreamCalls = [];
+	const stream = fakeStream("racing");
+	const { createFakeCallRuntime } = fakeCallRuntimeFactory();
+	const supervisor = createMeshSupervisor({
+		selfPubkey: ALICE,
+		selfPrivKey: new Uint8Array(32),
+		hTopic: "topic".padStart(64, "0"),
+		publish: async () => ({ ok: true }),
+		maxVoice: 5,
+		getUserMedia: () => gum.promise,
+		createCallRuntime: createFakeCallRuntime,
+		onLocalStream: (s) => localStreamCalls.push(s),
+	});
+
+	const joinPromise = supervisor.joinVoice(); // getUserMedia ещё не резолвился
+	supervisor.leaveVoice(); // "закрыть комнату, пока висит запрос разрешения микрофона"
+	gum.resolve(stream); // теперь getUserMedia резолвится — join должен быть уже отменён
+	const joined = await joinPromise;
+
+	assert.equal(joined, false, "joinVoice() обязан сообщить об отмене");
+	assert.equal(localStreamCalls.length, 0, "onLocalStream НЕ вызывается для отменённого join'а");
+	assert.ok(stream.tracks[0].stopped, "поток немедленно остановлен, не оставлен висеть с активным микрофоном");
+
+	// updateRoster не должен открывать рёбра — sharedStream так и не был присвоен.
+	applyRoster(supervisor, [ALICE, BOB]);
+	assert.deepEqual(supervisor.getEdgeStates(), []);
+});
+
+test("Этап 6: НЕ отменённый joinVoice() (leaveVoice() не вызывался) — join завершается нормально", async () => {
+	const gum = deferred();
+	const stream = fakeStream("normal");
+	const { createFakeCallRuntime } = fakeCallRuntimeFactory();
+	const supervisor = createMeshSupervisor({
+		selfPubkey: ALICE,
+		selfPrivKey: new Uint8Array(32),
+		hTopic: "topic".padStart(64, "0"),
+		publish: async () => ({ ok: true }),
+		maxVoice: 5,
+		getUserMedia: () => gum.promise,
+		createCallRuntime: createFakeCallRuntime,
+	});
+
+	const joinPromise = supervisor.joinVoice();
+	gum.resolve(stream);
+	const joined = await joinPromise;
+
+	assert.equal(joined, true);
+	assert.ok(!stream.tracks[0].stopped);
+});
+
+test("Этап 6, найдено интеграционной адверсарной фазой: onSignal ПОСЛЕ leaveVoice() (эквивалент состояния после close() всей сессии) — молча отброшено, не бросает, не открывает фантомное ребро", async () => {
+	const { supervisor } = setup({ selfPubkey: BOB }); // BOB > ALICE -> responder на реактивное открытие
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+	supervisor.leaveVoice(); // sharedStream=null, edgesByPeer пуст — то же состояние, что после close()
+
+	const staleOffer = { pubkey: ALICE, kind: 20075, content: "x", tags: [], id: "e-stale" };
+	assert.doesNotThrow(() => supervisor.onSignal(staleOffer));
+	assert.deepEqual(supervisor.getEdgeStates(), [], "не должно открыться фантомное ребро на уже покинутый голос");
+});
+
+// --- Адверсарная фаза (skill п.19) ---
+
+test("адверсарно: повторный updateRoster с ТЕМ ЖЕ составом — идемпотентно, не пересоздаёт рёбра", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+	assert.equal(instances.length, 1);
+	assert.equal(instances[0].placeCalls.length, 1);
+
+	applyRoster(supervisor, [ALICE, BOB]); // тот же состав ещё раз
+	assert.equal(instances.length, 1, "не создалось второе ребро на ту же пару");
+	assert.equal(instances[0].placeCalls.length, 1, "placeCall не вызван повторно");
+	assert.equal(instances[0].hangupCalls, 0, "ребро не закрывалось и не переоткрывалось");
+});
+
+test("адверсарно: onSignal ПОСЛЕ того, как ребро уже закрыто тем же тиком updateRoster — молча отброшено, не бросает", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+	applyRoster(supervisor, [ALICE]); // BOB вышел, ребро закрыто
+	assert.equal(instances[0].hangupCalls, 1);
+
+	const staleSignal = { pubkey: BOB, kind: 20075, content: "x", tags: [], id: "stale" };
+	assert.doesNotThrow(() => supervisor.onSignal(staleSignal));
+	assert.deepEqual(instances[0].incomingSignals, [], "закрытое ребро не получает сигналов");
+});
+
+test("адверсарно: leaveVoice() без единого открытого ребра (сразу после joinVoice) — не бросает", async () => {
+	const { supervisor, stream } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	assert.doesNotThrow(() => supervisor.leaveVoice());
+	assert.equal(stream.tracks[0].stopped, true);
+});
+
+test("адверсарно: updateRoster с пустым массивом (роспуск голоса извне, без leaveVoice) — закрывает все рёбра", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB, CAROL]);
+	assert.equal(instances.length, 2);
+
+	applyRoster(supervisor, []); // сам ALICE тоже "исчез" из переданного ростера
+	assert.equal(instances[0].hangupCalls, 1);
+	assert.equal(instances[1].hangupCalls, 1);
+	assert.deepEqual(supervisor.getEdgeStates(), []);
+});
+
+// --- Живая находка (три реальных браузера, полная тишина): гонка heartbeat/offer ---
+
+test("живая находка: onSignal ОТ ПИРА, ещё НЕ известного через updateRoster (offer обогнал heartbeat) — реактивно открывает ребро как responder, не роняет offer молча", async (t) => {
+	const { supervisor, instances } = setup({ selfPubkey: BOB }); // BOB > ALICE -> BOB был бы responder
+	await supervisor.joinVoice();
+	// updateRoster НЕ вызывался вовсе — BOB ещё не узнал через presence, что ALICE в голосе,
+	// но offer от ALICE уже пришёл (ровно гонка, найденная живьём).
+	assert.equal(instances.length, 0);
+
+	const offerEvent = { pubkey: ALICE, kind: 20075, content: "x", tags: [], id: "e1" };
+	supervisor.onSignal(offerEvent);
+
+	assert.equal(instances.length, 1, "ребро открыто реактивно, offer не потерян");
+	assert.deepEqual(instances[0].incomingSignals, [offerEvent]);
+	assert.deepEqual(instances[0].placeCalls, [], "мы НЕ инициатор — сами не звоним, только приняли");
+	assert.equal(supervisor.getEdgeStates().length, 1);
+	assert.equal(supervisor.getEdgeStates()[0].peer, ALICE);
+	assert.equal(supervisor.getEdgeStates()[0].role, "responder");
+	assert.equal(supervisor.getEdgeStates()[0].state, "IDLE");
+});
+
+test("живая находка: после реактивного открытия ПОСЛЕДУЮЩИЙ updateRoster с тем же ростером НЕ дублирует и НЕ закрывает ребро", async (t) => {
+	const { supervisor, instances } = setup({ selfPubkey: BOB });
+	await supervisor.joinVoice();
+
+	const offerEvent = { pubkey: ALICE, kind: 20075, content: "x", tags: [], id: "e1" };
+	supervisor.onSignal(offerEvent); // реактивное открытие ДО updateRoster
+
+	// Presence наконец догнал — тот же ростер, что уже фактически отражён реактивно.
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	assert.equal(instances.length, 1, "НЕ создалось второе (дублирующее) ребро");
+	assert.equal(instances[0].hangupCalls, 0, "и не закрылось как 'неизвестное' updateRoster'у ребро");
+});
+
+test("живая находка: onSignal от неизвестного пира ДО joinVoice() (нет sharedStream) — молча отброшено, не бросает", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: BOB });
+	// joinVoice() НЕ вызывался.
+	const offerEvent = { pubkey: ALICE, kind: 20075, content: "x", tags: [], id: "e1" };
+	assert.doesNotThrow(() => supervisor.onSignal(offerEvent));
+	assert.equal(instances.length, 0);
+});
+
+// TZ-diag-trace.md §2.7/§0.3 — onTrace/getRelayState/getIceCredsExpiryMs
+// пробрасываются в КАЖДЫЙ дочерний createCallRuntime (одно ребро — один
+// createCallRuntime, mesh-supervisor.js:37-52), не только hTopic/publish/iceServers.
+test("onTrace/getRelayState/getIceCredsExpiryMs пробрасываются в каждый дочерний createCallRuntime", async () => {
+	const onTrace = () => {};
+	const getRelayState = () => "connected";
+	const getIceCredsExpiryMs = () => 12345;
+	const { supervisor, instances } = setup({ onTrace, getRelayState, getIceCredsExpiryMs });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	assert.equal(instances[0].options.onTrace, onTrace);
+	assert.equal(instances[0].options.getRelayState, getRelayState);
+	assert.equal(instances[0].options.getIceCredsExpiryMs, getIceCredsExpiryMs);
+});
+
+// TZ §2.7 — переход ребра в ENDED сейчас не наблюдается никем (09-FINAL-AUDIT.md
+// §2, Opus H6) — трассировка это ТОЛЬКО фиксирует, updateRoster ниже по-прежнему
+// не переоткрывает ребро автоматически (проверено соседними тестами выше).
+test("onTrace видит 'edge-state' на каждом onStateChange дочернего runtime и 'roster' на каждом реальном изменении состава", async () => {
+	const traced = [];
+	const { supervisor, instances } = setup({ onTrace: (ev, payload) => traced.push({ ev, payload }) });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB]);
+
+	assert.ok(traced.some((t) => t.ev === "roster-diff" && t.payload.toOpen.length === 1 && t.payload.toClose.length === 0));
+
+	instances[0].runtime.placeCall(BOB); // фейковый runtime сам не эмитит onStateChange — вызываем то, что реально вызывает supervisor:
+	// onStateChange передан В КОНСТРУКТОР фейка (instance.options.onStateChange) — дёргаем его напрямую, как это сделал бы реальный call-runtime.js.
+	instances[0].options.onStateChange("INCOMING_RINGING");
+	assert.ok(traced.some((t) => t.ev === "edge-state" && t.payload.peer === BOB && t.payload.state === "INCOMING_RINGING"));
+
+	traced.length = 0;
+	applyRoster(supervisor, [ALICE, BOB]);
+	assert.equal(traced.filter((t) => t.ev === "roster-diff").length, 0, "идемпотентный reconcile не должен шуметь в трассировке");
+});
+
+test("ENDED при неизменном ростере -> reconcile создаёт новый runtime, старому hangup()", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	assert.equal(instances.length, 1);
+	instances[0].state = { name: "ENDED" };
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	assert.equal(instances.length, 2, "пересоздан runtime");
+	assert.equal(instances[0].hangupCalls, 1);
+});
+
+test("повторный reconcile до nextAttemptAt -> второго пересоздания нет", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	instances[0].state = { name: "ENDED" };
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	assert.equal(instances.length, 2);
+	instances[1].state = { name: "ENDED" };
+	applyRoster(supervisor, [ALICE, BOB], backoffMs(1) - 1);
+	assert.equal(instances.length, 2, "backoff ещё не истёк");
+	applyRoster(supervisor, [ALICE, BOB], backoffMs(1));
+	assert.equal(instances.length, 3);
+});
+
+test("CONNECTED без роста packetsReceived дольше healthStaleMs -> пересоздание", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	instances[0].state = { name: "CONNECTED" };
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	assert.equal(instances.length, 1);
+	applyRoster(supervisor, [ALICE, BOB], DEFAULT_HEALTH_STALE_MS + 1);
+	assert.equal(instances.length, 2);
+	assert.equal(instances[0].hangupCalls, 1);
+});
+
+test("CONNECTED, packetsReceived растёт -> пересоздания нет, attempts сброшен", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	instances[0].state = { name: "CONNECTED" };
+	instances[0].inboundStats = { packetsReceived: 4, bytesReceived: 80 };
+	await supervisor.pollHealth(100);
+	applyRoster(supervisor, [ALICE, BOB], 100);
+	assert.equal(instances.length, 1);
+	instances[0].inboundStats = { packetsReceived: 12, bytesReceived: 240 };
+	await supervisor.pollHealth(100 + 2000);
+	applyRoster(supervisor, [ALICE, BOB], 100 + 2000);
+	assert.equal(instances.length, 1);
+	assert.equal(instances[0].hangupCalls, 0);
+	assert.equal(supervisor.getEdgeStates()[0].attempts, 0);
+	assert.equal(supervisor.getEdgeStates()[0].phase, "live");
+});
+
+test("onSignal от пира, для которого self — меньший pubkey -> роль initiator, placeCall вызван", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	supervisor.onSignal({ pubkey: BOB, kind: 20075, content: "x", tags: [], id: "e1" }, 0);
+	assert.equal(instances.length, 1);
+	assert.deepEqual(instances[0].placeCalls, [BOB]);
+	assert.equal(supervisor.getEdgeStates()[0].role, "initiator");
+});
+
+test("onSignal от пира, для которого self — больший pubkey -> роль responder, placeCall не вызван", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: BOB });
+	await supervisor.joinVoice();
+	supervisor.onSignal({ pubkey: ALICE, kind: 20075, content: "x", tags: [], id: "e1" }, 0);
+	assert.equal(instances.length, 1);
+	assert.deepEqual(instances[0].placeCalls, []);
+	assert.equal(supervisor.getEdgeStates()[0].role, "responder");
+});
+
+test("старый runtime после пересоздания шлёт onRemoteStream — поток нового ребра не затирается", async () => {
+	const remoteStreamCalls = [];
+	const { supervisor, instances } = setup({
+		selfPubkey: ALICE,
+		onRemoteStream: (peer, stream) => remoteStreamCalls.push([peer, stream]),
+	});
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	instances[0].state = { name: "ENDED" };
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	assert.equal(instances.length, 2);
+	remoteStreamCalls.length = 0;
+	instances[1].options.onRemoteStream({ id: "fresh" });
+	instances[0].options.onRemoteStream({ id: "stale" });
+	assert.deepEqual(remoteStreamCalls, [[BOB, { id: "fresh" }]]);
+});
+
+test("ростер вырос с 3 до 4 -> рёбра первых трёх не пересозданы", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB, CAROL], 0);
+	assert.equal(instances.length, 2);
+	const first = instances[0];
+	const second = instances[1];
+	applyRoster(supervisor, [ALICE, BOB, CAROL, DAVE], 0);
+	assert.equal(instances.length, 3);
+	assert.equal(first.hangupCalls, 0);
+	assert.equal(second.hangupCalls, 0);
+	assert.equal(first.runtime, instances[0].runtime);
+	assert.equal(second.runtime, instances[1].runtime);
+});
+
+test("onSignal: grace держит реактивное ребро, пока heartbeat не догнал (ростер без пира не закрывает сразу)", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: BOB });
+	await supervisor.joinVoice();
+	supervisor.onSignal({ pubkey: ALICE, kind: 20075, content: "x", tags: [], id: "e1" }, 0);
+	assert.equal(instances.length, 1);
+	applyRoster(supervisor, [BOB], 1000);
+	assert.equal(instances.length, 1, "grace: ребро живо, хотя ростер ещё без ALICE");
+	assert.equal(instances[0].hangupCalls, 0);
+	applyRoster(supervisor, [BOB], 25001);
+	assert.equal(instances[0].hangupCalls, 1, "после SIGNAL_GRACE_MS ребро закрывается");
+});
+
+test("pollHealth: stats старого generation не записываются в новое ребро", async () => {
+	const { supervisor, instances } = setup({ selfPubkey: ALICE });
+	await supervisor.joinVoice();
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	instances[0].state = { name: "CONNECTED" };
+	applyRoster(supervisor, [ALICE, BOB], 0);
+	let release;
+	instances[0].statsWait = new Promise((r) => {
+		release = r;
+	});
+	instances[0].inboundStats = { packetsReceived: 50, bytesReceived: 500 };
+	const poll = supervisor.pollHealth(100);
+	instances[0].state = { name: "ENDED" };
+	applyRoster(supervisor, [ALICE, BOB], 100);
+	assert.equal(instances.length, 2);
+	instances[1].state = { name: "CONNECTED" };
+	release();
+	await poll;
+	applyRoster(supervisor, [ALICE, BOB], 100);
+	assert.equal(supervisor.getEdgeStates()[0].phase, "opening", "свежее ребро не стало live по чужим пакетам");
+});

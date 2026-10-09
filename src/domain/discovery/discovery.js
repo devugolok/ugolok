@@ -1,0 +1,156 @@
+import { sign } from '../../core/crypto/sign.js';
+import { db } from '../../core/store/database.js';
+import { listOwnedChannels } from '../content/channel.js';
+import { requirePublishOk } from "../messaging/chat.js";
+import { enqueue } from "../../core/store/outbox.js";
+import { getProfile } from "../../core/crypto/keystore.js";
+
+export const DISCOVERY_KIND = 30073;
+export const DISCOVERY_DURATIONS = [600, 3600, 86400];
+export const DISCOVERY_BIO_MAX_LENGTH = 300;
+export const DISCOVERY_NAME_MAX_LENGTH = 100;
+export const DISCOVERY_DESCRIPTION_MAX_LENGTH = 300;
+export const DISCOVERY_RULES_MAX_LENGTH = 600;
+
+export function buildDiscoveryEvent(privKey, { visible, showChannels, channels, showRules, visibleUntil, bio }, createdAt = Math.floor(Date.now() / 1000)) {
+    if (visible && (!Number.isFinite(visibleUntil) || visibleUntil <= createdAt)) {
+        throw new Error('visibleUntil обязателен и должен быть в будущем относительно createdAt при visible: true');
+    }
+    const truncatedBio = (typeof bio === 'string' ? bio : '').slice(0, DISCOVERY_BIO_MAX_LENGTH);
+    const cleanChannels = (Array.isArray(channels) ? channels : []).map((c) => ({
+        id: c.id,
+        name: (typeof c.name === 'string' ? c.name : '').slice(0, DISCOVERY_NAME_MAX_LENGTH),
+        description: (typeof c.description === 'string' ? c.description : '').slice(0, DISCOVERY_DESCRIPTION_MAX_LENGTH),
+        rules: showRules ? (typeof c.rules === 'string' ? c.rules : '').slice(0, DISCOVERY_RULES_MAX_LENGTH) : '',
+    }));
+    const tags = [['d', 'discovery']];
+    if (visible) {
+        tags.push(['expiration', String(visibleUntil)]);
+    }
+    return sign({
+        kind: DISCOVERY_KIND,
+        tags,
+        created_at: createdAt,
+        content: JSON.stringify({ visible, visibleUntil, showChannels: !!showChannels, showRules: !!showRules, channels: cleanChannels, bio: truncatedBio })
+    }, privKey);
+}
+
+export function parseDiscoveryEvent(event) {
+    const parsed = JSON.parse(event.content);
+    const visible = !!parsed.visible;
+    let visibleUntil;
+    if (visible) {
+        visibleUntil = Number(parsed.visibleUntil);
+        if (!Number.isFinite(visibleUntil) || visibleUntil <= 0) {
+            throw new Error('visibleUntil обязателен при visible: true');
+        }
+    } else {
+        visibleUntil = Number(parsed.visibleUntil) || 0;
+    }
+    const bio = (typeof parsed.bio === 'string' ? parsed.bio : '').slice(0, DISCOVERY_BIO_MAX_LENGTH);
+    return {
+        visible,
+        showChannels: !!parsed.showChannels,
+        showRules: !!parsed.showRules,
+        channels: Array.isArray(parsed.channels) ?
+            parsed.channels
+                .filter(c => c && typeof c === 'object' && typeof c.id === 'string'
+                    && typeof c.name === 'string' && typeof c.description === 'string')
+                .map(c => ({
+                    id: c.id,
+                    name: c.name.slice(0, DISCOVERY_NAME_MAX_LENGTH),
+                    description: c.description.slice(0, DISCOVERY_DESCRIPTION_MAX_LENGTH),
+                    rules: typeof c.rules === 'string' ? c.rules.slice(0, DISCOVERY_RULES_MAX_LENGTH) : '',
+                }))
+            : [],
+        visibleUntil,
+        bio
+    };
+}
+
+export async function loadDiscoverySettings(ownerPubkey) {
+    const row = await db.table("discoverySettings").get(ownerPubkey);
+    return row ? {
+        visible: row.visible,
+        showChannels: row.showChannels,
+        channelIds: row.channelIds,
+        showBio: row.showBio ?? true,
+        showRules: row.showRules ?? false,
+        visibleUntil: row.visibleUntil
+    } : {
+        visible: false,
+        showChannels: false,
+        channelIds: [],
+        showBio: true,
+        showRules: false,
+        visibleUntil: 0
+    };
+}
+
+export async function publishDiscoverySettings(ownerPubkey, privKey, dbKey, { visible, showChannels, channelIds, showBio, showRules, visibleUntil }, publish) {
+    // Найдено адверсарной живой проверкой (T5) — быстрое "включить" ->
+    // "Скрыть сейчас" в пределах ОДНОЙ секунды даёт два kind:30073 с
+    // одинаковым Math.floor(Date.now()/1000): strfry (параметризованно-
+    // заменяемое событие, NIP-01) отклоняет второе как "не строго новее".
+    // lastCreatedAt — служебное поле, НЕ часть контракта loadDiscoverySettings.
+    const previous = await db.table("discoverySettings").get(ownerPubkey);
+    const createdAt = Math.max(Math.floor(Date.now() / 1000), (previous?.lastCreatedAt ?? 0) + 1);
+
+    // CONTRACTS.md §DISCOVERY-REDESIGN, D5 — снимок каналов протухает: если
+    // канал удалён владельцем, его id не должен продолжать мусорить в
+    // локальном channelIds (раньше фильтровался только состав события, не
+    // локальная копия).
+    const owned = await listOwnedChannels(ownerPubkey, dbKey);
+    const ownedIds = new Set(owned.map((c) => c.id));
+    const cleanChannelIds = channelIds.filter((id) => ownedIds.has(id));
+
+    await db.table("discoverySettings").put({ ownerPubkey, visible, showChannels, channelIds: cleanChannelIds, showBio, showRules, visibleUntil, lastCreatedAt: createdAt });
+
+    let channels = [];
+    let bio = '';
+    if (visible) {
+        channels = showChannels
+            ? owned.filter((c) => cleanChannelIds.includes(c.id)).map((c) => ({ id: c.id, name: c.name, description: c.description, rules: c.rules }))
+            : [];
+        if (showBio) {
+            try {
+                bio = (await getProfile(ownerPubkey)).bio;
+            } catch {
+                // аккаунта в keystore нет (не должно происходить в реальности) — bio остаётся ''
+            }
+        }
+    }
+
+    // CONTRACTS.md §DISCOVERY-REDESIGN, D1 — при visible:false в СОБЫТИЕ уходит
+    // надгробие (bio/channels/showChannels/showRules пустые, visibleUntil:0), а
+    // ЛОКАЛЬНАЯ строка выше уже сохранила то, что реально передал вызывающий код —
+    // настройки пользователя (какие каналы отмечены, showBio/showRules) не
+    // сбрасываются от выключения, сбрасывается только то, что уходит наружу на реле.
+    const event = buildDiscoveryEvent(
+        privKey,
+        {
+            visible,
+            showChannels: visible && showChannels,
+            channels,
+            showRules: visible && showRules,
+            visibleUntil: visible ? visibleUntil : 0,
+            bio,
+        },
+        createdAt,
+    );
+
+    try {
+        await requirePublishOk(publish, event);
+    } catch (e) {
+        await enqueue(event, dbKey);
+        throw e;
+    }
+}
+
+// CONTRACTS.md §DISCOVERY, T5 — автоистечение в UI: событие с visible:false
+// публиковать не нужно (expiration + фильтр читателя уже прячут карточку),
+// локальный флаг только чтобы переключатель у ВЛАДЕЛЬЦА не показывал
+// "включено" с истёкшим сроком до следующего явного действия.
+export async function markDiscoveryExpired(ownerPubkey) {
+    await db.table("discoverySettings").update(ownerPubkey, { visible: false });
+}

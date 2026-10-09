@@ -1,0 +1,118 @@
+// Rooms, этап 2 — собственный транспортный клиент комнаты. Контракт:
+// PROCESS-DOCS/CONTRACTS.md "Rooms — Этап 2" (room-transport.js); ROOMS-SPEC.md §4.2.
+//
+// Второй, независимый транспортный клиент (ROOMS-SPEC §0) — собственное
+// соединение, НЕ трогает module-level connection из ui/signals/transport.js.
+import { createRelayConnection } from "../../../core/transport/relay-pool.js";
+import { createPublisher } from "../../../core/transport/publisher.js";
+import { createSubscriber } from "../../../core/transport/subscriber.js";
+import { verify } from "../../../core/crypto/sign.js";
+import { ROOM_ANNOUNCE_KIND, ROOM_PROBE_KIND, ROOM_PRESENCE_KIND, ROOM_CHAT_KIND, ROOM_POINTER_KIND } from "../../events/kind-registry.js";
+import { CALL_SIGNAL_KIND } from "../../calls/signaling-adapter.js";
+
+const ROOM_KINDS = [ROOM_ANNOUNCE_KIND, ROOM_PROBE_KIND, ROOM_PRESENCE_KIND, ROOM_CHAT_KIND];
+const SUB_ID = "room";
+
+function waitForConnState(conn, predicate, timeoutMs) {
+	return new Promise((resolve, reject) => {
+		if (predicate(conn.getState())) return resolve();
+		const t0 = Date.now();
+		const iv = setInterval(() => {
+			if (predicate(conn.getState())) {
+				clearInterval(iv);
+				resolve();
+			} else if (Date.now() - t0 > timeoutMs) {
+				clearInterval(iv);
+				reject(new Error(`room-transport: таймаут ожидания состояния соединения (сейчас: "${conn.getState()}")`));
+			}
+		}, 50);
+	});
+}
+
+function hasTag(event, name, value) {
+	return event.tags.some((tag) => tag[0] === name && tag[1] === value);
+}
+
+// hTopic/hDisc — как минимум один обязателен (Этап 3, открытый режим): joiner
+// по паролю на фазе обнаружения знает только hDisc (suffix, а с ним hTopic, ещё
+// не найден); обычная закрытая/уже-найденная сессия знает hTopic (и опционально
+// ТАКЖЕ hDisc — открытый режим создателя слушает указатели-конкуренты, И9).
+// Этап 6 — onConnectionStateChange (аддитивный, необязательный): пробрасывает
+// уже существующий примитив relay-pool.js's onStateChange (тот же, что двигает
+// connState главного приложения, ui/signals/transport.js) наверх, чтобы UI
+// комнаты мог показать "переподключение"/"офлайн" (ROOMS-SPEC §7, "Релей
+// отвалился"). autoReconnect у relay-pool.js включён по умолчанию — этот
+// колбэк только НАБЛЮДАЕТ состояние, ничего не меняет в поведении реконнекта.
+// onTrace (TZ-diag-trace.md §0.3/§2.5) — необязательный, DI: этот файл не
+// импортирует трассировщик, только пробрасывает колбэк дальше в relay-pool.js.
+export async function openRoomTransport({ relayUrl, hTopic = null, hDisc = null, selfPubkey, onEvent, onConnectionStateChange = () => {}, onTrace }) {
+	if (!hTopic && !hDisc) throw new Error("room-transport: нужен хотя бы один из hTopic/hDisc");
+	let publisher; // назначается ниже — onStateChange может сработать синхронно до этого
+	// Этап 2 (MESSAGE-DELIVERY-TZ.md, З2.2) — тот же класс дефекта, что H2
+	// (publisher.publish() без ответа "OK" висит бесконечно), у второго,
+	// независимого транспортного клиента комнаты (ROOMS-SPEC §0): без этого
+	// отклонение зависших publish() на обрыве связи не происходило бы вовсе —
+	// каждый ждал бы собственные 15с publisher.js даже после явного close()/
+	// обрыва, до которого комната уже могла быть закрыта пользователем.
+	const conn = createRelayConnection(relayUrl, {
+		onStateChange: (state, prev) => {
+			if (state === "disconnected") publisher?.rejectAll("disconnected", "room-transport: связь потеряна");
+			onConnectionStateChange(state, prev);
+		},
+		onTrace,
+	});
+	conn.connect();
+	await waitForConnState(conn, (s) => s === "connected", 8000);
+
+	publisher = createPublisher(conn);
+
+	function verifyBatch(events) {
+		return events.map(verify);
+	}
+
+	function onBatch(events) {
+		for (const event of events) {
+			if (event.kind === ROOM_POINTER_KIND) {
+				if (!hDisc || !hasTag(event, "h", hDisc)) continue;
+				onEvent(event);
+				continue;
+			}
+			if (!hTopic || !hasTag(event, "h", hTopic)) continue;
+			if (event.kind === CALL_SIGNAL_KIND && !hasTag(event, "p", selfPubkey)) continue;
+			onEvent(event);
+		}
+	}
+
+	const subscriber = createSubscriber(conn, { verifyBatch, onBatch, onEose: () => {} });
+
+	conn.addMessageHandler(publisher.handleMessage);
+	conn.addMessageHandler(subscriber.handleMessage);
+	const filters = [];
+	if (hTopic) {
+		filters.push({ kinds: ROOM_KINDS, "#h": [hTopic] });
+		filters.push({ kinds: [CALL_SIGNAL_KIND], "#h": [hTopic], "#p": [selfPubkey] });
+	}
+	if (hDisc) filters.push({ kinds: [ROOM_POINTER_KIND], "#h": [hDisc] });
+	subscriber.subscribe(SUB_ID, filters);
+
+	function publish(event) {
+		return publisher.publish(event);
+	}
+
+	function close() {
+		// Живой фидбек пользователя (room-session.js's close() теперь публикует
+		// best-effort exit-событие) — publisher.publish() батчит (batchWindowMs,
+		// по умолчанию 200мс, publisher.js), реальный connection.send() уходит
+		// ОТЛОЖЕННО через setTimeout. Без явного flush() здесь только что
+		// поставленное в очередь событие просто не успевало бы уйти — conn.close()
+		// рвёт соединение раньше, чем сработает отложенный таймер батча.
+		publisher.flush();
+		conn.close();
+		// Этап 2 (З2.2) — любой publish(), для которого "OK" так и не пришёл до
+		// явного закрытия комнаты, отклоняется здесь и сейчас — не должен ждать
+		// собственные 15с уже после того, как пользователь ушёл из комнаты.
+		publisher.rejectAll("disconnected", "room-transport: комната закрыта");
+	}
+
+	return { publish, close };
+}

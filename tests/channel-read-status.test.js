@@ -1,0 +1,261 @@
+import "fake-indexeddb/auto";
+import { test, before, beforeEach, after } from "node:test";
+import assert from "node:assert/strict";
+import { db } from "../src/core/store/database.js";
+import { getPublicKey } from "../src/core/crypto/keys.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+import { toEncryptedRow } from "../src/core/store/encrypted-table.js";
+import { POSTS_PLAINTEXT_FIELDS, COMMENTS_PLAINTEXT_FIELDS, CHANNEL_MESSAGES_PLAINTEXT_FIELDS } from "../src/core/store/table-fields.js";
+import {
+	CHANNEL_READ_STATUS_KIND,
+	buildChannelReadStatusEvent,
+	parseChannelReadStatusEvent,
+	foldChannelReadStatus,
+	markChannelAsRead,
+	rebuildChannelReadStatus,
+	getChannelUnreadCount,
+	getChannelChatUnreadCount,
+	isChannelContentRead,
+	channelReadStatusDTag,
+} from "../src/domain/content/channel-read-status.js";
+
+const ALICE_PRIV = new Uint8Array(32).fill(21);
+const ALICE_PUB = bytesToHex(getPublicKey(ALICE_PRIV));
+const BOB_PUB = "b".repeat(64);
+const DB_KEY = crypto.getRandomValues(new Uint8Array(32));
+const CHAN_A = "chan-a";
+const CHAN_B = "chan-b";
+
+before(async () => {
+	await db.open();
+});
+
+beforeEach(async () => {
+	await db.table("channelSyncState").clear();
+	await db.table("posts").clear();
+	await db.table("comments").clear();
+	await db.table("channelMessages").clear();
+	await db.table("events").clear();
+});
+
+after(() => {
+	db.close();
+});
+
+test("CHANNEL_READ_STATUS_KIND: 30074", () => {
+	assert.equal(CHANNEL_READ_STATUS_KIND, 30074);
+});
+
+test("buildChannelReadStatusEvent/parseChannelReadStatusEvent: round-trip, d-tag непрозрачен (AUDIT-EGOROD J1)", () => {
+	const event = buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 1000 });
+	assert.equal(event.kind, 30074);
+	assert.equal(event.tags.length, 1);
+	assert.notEqual(event.tags[0][1], CHAN_A);
+	assert.ok(!JSON.stringify(event).includes(CHAN_A), "id канала не в открытой части события");
+	assert.equal(event.tags[0][1], channelReadStatusDTag(ALICE_PRIV, CHAN_A), "тег стабилен для замены на relay");
+	const parsed = parseChannelReadStatusEvent(event, ALICE_PRIV);
+	assert.deepEqual(parsed, { channelId: CHAN_A, lastReadAt: 1000, legacy: false });
+});
+
+test("foldChannelReadStatus: сохраняет lastReadAt в channelSyncState (голый put, без шифрования)", async () => {
+	const event = buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 500 });
+	await foldChannelReadStatus(event, ALICE_PRIV);
+	const row = await db.table("channelSyncState").get([ALICE_PUB, CHAN_A]);
+	assert.equal(row.lastReadAt, 500);
+	assert.equal(row.nonce, undefined, "таблица целиком plaintext — нет шифрования");
+});
+
+test("foldChannelReadStatus: monotonic guard — не откатывает назад более свежее локальное значение", async () => {
+	await foldChannelReadStatus(buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 900 }), ALICE_PRIV);
+	await foldChannelReadStatus(buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 100 }), ALICE_PRIV);
+	const row = await db.table("channelSyncState").get([ALICE_PUB, CHAN_A]);
+	assert.equal(row.lastReadAt, 900);
+});
+
+test("markChannelAsRead: публикует событие и применяет fold локально сразу", async () => {
+	let publishedEvent;
+	const publish = async (event) => {
+		publishedEvent = event;
+		return { ok: true };
+	};
+	await markChannelAsRead(ALICE_PUB, ALICE_PRIV, CHAN_A, 42, publish);
+	assert.equal(publishedEvent.kind, 30074);
+	const row = await db.table("channelSyncState").get([ALICE_PUB, CHAN_A]);
+	assert.equal(row.lastReadAt, 42);
+});
+
+// Этап 50-довесок (пользователь, живая проверка) — контракт ИЗМЕНЁН: раньше
+// сбой publish откатывал/блокировал локальный fold (throw, ничего не
+// применено), из-за чего бейдж "Каналы [N]" мог застрять устаревшим
+// неограниченно долго при любой сетевой заминке. Теперь локальное прочтение
+// применяется БЕЗУСЛОВНО и ПЕРВЫМ — сбой publish (или его отсутствие/зависание)
+// больше не мешает пользователю увидеть, что он прочитал.
+test("markChannelAsRead: сбой публикации -> локальный fold ВСЁ РАВНО применяется (бейдж не должен зависеть от сети), не бросает", async () => {
+	const publish = async () => ({ ok: false, reason: "отклонено" });
+	await assert.doesNotReject(() => markChannelAsRead(ALICE_PUB, ALICE_PRIV, CHAN_A, 42, publish));
+	const row = await db.table("channelSyncState").get([ALICE_PUB, CHAN_A]);
+	assert.equal(row.lastReadAt, 42, "локальный курсор обязан продвинуться, несмотря на отклонённую публикацию");
+});
+
+test("markChannelAsRead: publish() бросает исключение (не просто {ok:false}) -> тоже не мешает локальному fold", async () => {
+	const publish = async () => {
+		throw new Error("сеть недоступна");
+	};
+	await assert.doesNotReject(() => markChannelAsRead(ALICE_PUB, ALICE_PRIV, CHAN_A, 99, publish));
+	const row = await db.table("channelSyncState").get([ALICE_PUB, CHAN_A]);
+	assert.equal(row.lastReadAt, 99);
+});
+
+test("rebuildChannelReadStatus: восстанавливает несколько каналов независимо, LWW по created_at на дубли", async () => {
+	const eventA = buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 10 }, 1000);
+	const olderA = buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 999 }, 500);
+	const eventB = buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_B, lastReadAt: 20 }, 1000);
+	await db.table("events").bulkAdd([eventA, olderA, eventB]);
+
+	await rebuildChannelReadStatus(ALICE_PUB, ALICE_PRIV);
+
+	assert.equal((await db.table("channelSyncState").get([ALICE_PUB, CHAN_A])).lastReadAt, 10, "новее по created_at побеждает старую версию с БОЛЬШИМ lastReadAt");
+	assert.equal((await db.table("channelSyncState").get([ALICE_PUB, CHAN_B])).lastReadAt, 20);
+});
+
+test("rebuildChannelReadStatus АДВЕРСАРНО: нет ни одного kind 30074 в events — no-op, не бросает", async () => {
+	await assert.doesNotReject(() => rebuildChannelReadStatus(ALICE_PUB, ALICE_PRIV));
+});
+
+// --- getChannelUnreadCount: три таблицы, разная доступность полей без расшифровки ---
+
+test("getChannelUnreadCount: без read-status — все чужие posts/comments/channelMessages непрочитаны, свои не считаются", async () => {
+	await db.table("posts").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "p1", channelId: CHAN_A, createdAt: 100, deleted: false, status: "published", keyVersion: 1, authorPubkey: BOB_PUB, text: "x", attachments: [] }, POSTS_PLAINTEXT_FIELDS, DB_KEY),
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "p2", channelId: CHAN_A, createdAt: 200, deleted: false, status: "published", keyVersion: 1, authorPubkey: ALICE_PUB, text: "моё", attachments: [] }, POSTS_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	await db.table("comments").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "c1", postId: "p1", parentId: "p1", deleted: false, channelId: CHAN_A, authorPubkey: BOB_PUB, createdAt: 150, text: "y", attachments: [], keyVersion: 1 }, COMMENTS_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	await db.table("channelMessages").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "m1", channelId: CHAN_A, createdAt: 120, deleted: false, authorPubkey: BOB_PUB, text: "z", attachments: [], keyVersion: 1 }, CHANNEL_MESSAGES_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+
+	const count = await getChannelUnreadCount(ALICE_PUB, CHAN_A, DB_KEY);
+	assert.equal(count, 3, "p1 (чужой пост) + c1 (чужой коммент) + m1 (чужое сообщение чата) = 3, p2 (свой пост) не считается");
+});
+
+test("getChannelUnreadCount: после markChannelAsRead — только контент новее курсора", async () => {
+	await db.table("posts").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "p1", channelId: CHAN_A, createdAt: 100, deleted: false, status: "published", keyVersion: 1, authorPubkey: BOB_PUB, text: "старый", attachments: [] }, POSTS_PLAINTEXT_FIELDS, DB_KEY),
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "p2", channelId: CHAN_A, createdAt: 300, deleted: false, status: "published", keyVersion: 1, authorPubkey: BOB_PUB, text: "новый", attachments: [] }, POSTS_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	await foldChannelReadStatus(buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 200 }), ALICE_PRIV);
+
+	const count = await getChannelUnreadCount(ALICE_PUB, CHAN_A, DB_KEY);
+	assert.equal(count, 1, "только p2 (createdAt=300 > курсора 200)");
+});
+
+test("getChannelUnreadCount: не путает каналы (chan-a и chan-b независимы)", async () => {
+	await db.table("posts").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "p1", channelId: CHAN_A, createdAt: 100, deleted: false, status: "published", keyVersion: 1, authorPubkey: BOB_PUB, text: "a", attachments: [] }, POSTS_PLAINTEXT_FIELDS, DB_KEY),
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "p2", channelId: CHAN_B, createdAt: 100, deleted: false, status: "published", keyVersion: 1, authorPubkey: BOB_PUB, text: "b", attachments: [] }, POSTS_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	assert.equal(await getChannelUnreadCount(ALICE_PUB, CHAN_A, DB_KEY), 1);
+	assert.equal(await getChannelUnreadCount(ALICE_PUB, CHAN_B, DB_KEY), 1);
+});
+
+test("getChannelUnreadCount: удалённые (deleted=true) не считаются", async () => {
+	await db.table("channelMessages").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "m1", channelId: CHAN_A, createdAt: 100, deleted: true, authorPubkey: BOB_PUB, text: "z", attachments: [], keyVersion: 1 }, CHANNEL_MESSAGES_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	assert.equal(await getChannelUnreadCount(ALICE_PUB, CHAN_A, DB_KEY), 0);
+});
+
+// Этап 56 (найдено живой проверкой, реальный аккаунт в Safari) — "осиротевший"
+// ответ на комментарий (родитель отсутствует локально — не получен либо отброшен
+// крипто-барьером receiveComment на устаревшей версии ключа) никогда не
+// отображается в дереве комментариев (buildTree не может его пристроить), поэтому
+// пользователь никогда не может его "прочитать" — бейдж "Каналы [N]" висел бы
+// навсегда без фикса.
+test("getChannelUnreadCount: 'осиротевший' комментарий (родитель отсутствует локально) НЕ считается непрочитанным", async () => {
+	await db.table("comments").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "orphan-1", postId: "p1", parentId: "missing-parent-id", deleted: false, channelId: CHAN_A, authorPubkey: BOB_PUB, createdAt: 150, text: "осиротевший ответ", attachments: [], keyVersion: 1 }, COMMENTS_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	assert.equal(await getChannelUnreadCount(ALICE_PUB, CHAN_A, DB_KEY), 0, "недостижимый комментарий никогда не отобразится в дереве — не должен считаться непрочитанным");
+});
+
+test("getChannelUnreadCount: обычный достижимый ответ (родитель есть локально) по-прежнему считается", async () => {
+	await db.table("comments").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "root-1", postId: "p1", parentId: "p1", deleted: false, channelId: CHAN_A, authorPubkey: BOB_PUB, createdAt: 100, text: "корневой", attachments: [], keyVersion: 1 }, COMMENTS_PLAINTEXT_FIELDS, DB_KEY),
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "reply-1", postId: "p1", parentId: "root-1", deleted: false, channelId: CHAN_A, authorPubkey: BOB_PUB, createdAt: 150, text: "ответ", attachments: [], keyVersion: 1 }, COMMENTS_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	assert.equal(await getChannelUnreadCount(ALICE_PUB, CHAN_A, DB_KEY), 2, "оба комментария достижимы через цепочку parentId -> postId");
+});
+
+// --- getChannelChatUnreadCount: HEADERS этап 3 — бейдж вкладки "Чат",
+// та же логика, что chat-часть getChannelUnreadCount, но БЕЗ posts/comments
+// (dbKey не нужен — channelMessages целиком plaintext по нужным полям). ---
+
+test("getChannelChatUnreadCount: без read-status — чужие channelMessages непрочитаны, свои не считаются", async () => {
+	await db.table("channelMessages").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "m1", channelId: CHAN_A, createdAt: 100, deleted: false, authorPubkey: BOB_PUB, text: "чужое", attachments: [], keyVersion: 1 }, CHANNEL_MESSAGES_PLAINTEXT_FIELDS, DB_KEY),
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "m2", channelId: CHAN_A, createdAt: 200, deleted: false, authorPubkey: ALICE_PUB, text: "своё", attachments: [], keyVersion: 1 }, CHANNEL_MESSAGES_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	assert.equal(await getChannelChatUnreadCount(ALICE_PUB, CHAN_A), 1, "только m1 (чужое), m2 (своё) не считается");
+});
+
+test("getChannelChatUnreadCount: после markChannelAsRead — только сообщения новее курсора", async () => {
+	await db.table("channelMessages").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "m1", channelId: CHAN_A, createdAt: 100, deleted: false, authorPubkey: BOB_PUB, text: "старое", attachments: [], keyVersion: 1 }, CHANNEL_MESSAGES_PLAINTEXT_FIELDS, DB_KEY),
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "m2", channelId: CHAN_A, createdAt: 300, deleted: false, authorPubkey: BOB_PUB, text: "новое", attachments: [], keyVersion: 1 }, CHANNEL_MESSAGES_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	await foldChannelReadStatus(buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 200 }), ALICE_PRIV);
+	assert.equal(await getChannelChatUnreadCount(ALICE_PUB, CHAN_A), 1, "только m2 (createdAt=300 > курсора 200)");
+});
+
+test("getChannelChatUnreadCount: не путает каналы", async () => {
+	await db.table("channelMessages").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "m1", channelId: CHAN_A, createdAt: 100, deleted: false, authorPubkey: BOB_PUB, text: "a", attachments: [], keyVersion: 1 }, CHANNEL_MESSAGES_PLAINTEXT_FIELDS, DB_KEY),
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "m2", channelId: CHAN_B, createdAt: 100, deleted: false, authorPubkey: BOB_PUB, text: "b", attachments: [], keyVersion: 1 }, CHANNEL_MESSAGES_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	assert.equal(await getChannelChatUnreadCount(ALICE_PUB, CHAN_A), 1);
+	assert.equal(await getChannelChatUnreadCount(ALICE_PUB, CHAN_B), 1);
+});
+
+test("getChannelChatUnreadCount: удалённые (deleted=true) не считаются", async () => {
+	await db.table("channelMessages").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "m1", channelId: CHAN_A, createdAt: 100, deleted: true, authorPubkey: BOB_PUB, text: "z", attachments: [], keyVersion: 1 }, CHANNEL_MESSAGES_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	assert.equal(await getChannelChatUnreadCount(ALICE_PUB, CHAN_A), 0);
+});
+
+test("getChannelChatUnreadCount: НЕ считает posts/comments (изолирован от getChannelUnreadCount's остальных двух таблиц)", async () => {
+	await db.table("posts").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "p1", channelId: CHAN_A, createdAt: 100, deleted: false, status: "published", keyVersion: 1, authorPubkey: BOB_PUB, text: "пост", attachments: [] }, POSTS_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	await db.table("comments").bulkAdd([
+		toEncryptedRow({ ownerPubkey: ALICE_PUB, id: "c1", postId: "p1", parentId: "p1", deleted: false, channelId: CHAN_A, authorPubkey: BOB_PUB, createdAt: 150, text: "коммент", attachments: [], keyVersion: 1 }, COMMENTS_PLAINTEXT_FIELDS, DB_KEY),
+	]);
+	assert.equal(await getChannelChatUnreadCount(ALICE_PUB, CHAN_A), 0, "posts/comments не относятся к счётчику чата, только channelMessages");
+});
+
+test("getChannelChatUnreadCount: пустой канал -> 0, не бросает", async () => {
+	assert.equal(await getChannelChatUnreadCount(ALICE_PUB, CHAN_A), 0);
+});
+
+// Этап 50 — инвариант N1 (CONTACTS-FSM.md §6, приложение А).
+test("isChannelContentRead: нет курсора вовсе -> false", async () => {
+	assert.equal(await isChannelContentRead(ALICE_PUB, CHAN_A, 1), false);
+});
+
+test("isChannelContentRead: createdAt <= курсора -> true (уже прочитано)", async () => {
+	await foldChannelReadStatus(buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 500 }), ALICE_PRIV);
+	assert.equal(await isChannelContentRead(ALICE_PUB, CHAN_A, 500), true, "ровно на курсоре");
+	assert.equal(await isChannelContentRead(ALICE_PUB, CHAN_A, 100), true, "старее курсора");
+});
+
+test("isChannelContentRead: createdAt > курсора -> false", async () => {
+	await foldChannelReadStatus(buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_A, lastReadAt: 500 }), ALICE_PRIV);
+	assert.equal(await isChannelContentRead(ALICE_PUB, CHAN_A, 501), false);
+});
+
+test("isChannelContentRead: курсор ДРУГОГО канала не влияет", async () => {
+	await foldChannelReadStatus(buildChannelReadStatusEvent(ALICE_PRIV, { channelId: CHAN_B, lastReadAt: 999 }), ALICE_PRIV);
+	assert.equal(await isChannelContentRead(ALICE_PUB, CHAN_A, 1), false);
+});

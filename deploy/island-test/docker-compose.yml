@@ -1,0 +1,38 @@
+# Тестовый остров test.ugolok.tech. Образы те же, что прод (ugolok-strfry:local /
+# ugolok-blossom:local). Данные отдельно. TURN общий (хостовый coturn).
+# Caddy — deploy/caddy/test.caddy, порты только localhost.
+
+name: ugolok-test
+
+services:
+  relay:
+    image: ugolok-strfry:local
+    container_name: ugolok-test-relay
+    restart: unless-stopped
+    volumes:
+      - ./strfry.conf:/app/strfry.conf:ro
+      - /var/lib/ugolok/test/relay:/app/strfry-db
+    ports:
+      - "127.0.0.1:7778:7777"
+    mem_limit: 256m
+
+  blossom:
+    # Тот же пинованный образ, что у боевого острова (deploy/island/docker-compose.yml).
+    image: git.ugolok.tech/naysy/ugolok-blossom:1.2.0
+    container_name: ugolok-test-blossom
+    restart: unless-stopped
+    volumes:
+      - ./blossom-config.yml:/app/config.yml:ro
+      - /var/lib/ugolok/test/blossom:/app/data
+    ports:
+      - "127.0.0.1:8001:8000"
+    # Живая проверка 2026-09-10: 128m + sqlite 330 МиБ (database.sqlite3)
+    # дали RestartCount=20, Range-GET 502/404, видео рвалось. Форк грузит
+    # блоб целиком в память на каждый Range (тот же комментарий, что у
+    # prod island). Память как на проде — 512m.
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/stats"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

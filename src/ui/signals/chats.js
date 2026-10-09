@@ -1,0 +1,182 @@
+import { signal } from "@preact/signals";
+import { bytesToHex } from "@noble/hashes/utils.js";
+import { db } from "../../core/store/database.js";
+import { ensureChatEstablished, sendMessage, enqueuePendingOutgoingMessage, upsertMessage } from "../../domain/messaging/chat.js";
+import { wrap as nip59Wrap } from "../../core/crypto/nip59.js";
+import { buildChatOpenRequestRumor } from "../../domain/contacts/requests.js";
+import { touchChatActivity } from "../../domain/messaging/chat-activity.js";
+import { deleteMessage, deleteMessageForMe, clearChatHistory } from "../../domain/messaging/deletions.js";
+import { deleteChatForever } from "../../domain/messaging/chat-delete.js";
+import { editMessage } from "../../domain/messaging/edits.js";
+import { reactToMessage } from "../../domain/messaging/reactions.js";
+import { sanitizeReplyTo } from "../../domain/messaging/reply.js";
+import { markChatAsRead } from "../../domain/messaging/read-status.js";
+import { saveDraft } from "../../domain/messaging/drafts.js";
+import { fromEncryptedRow } from "../../core/store/encrypted-table.js";
+import { record as traceDelivery } from "../../core/diag/delivery-trace.js";
+
+// Находка 2 (CONTRACTS.md, этап 27): диспетчер transport.js работает вне React
+// re-render — этот сигнал сообщает UI "что-то изменилось" (новое сообщение/Welcome/
+// contact-request/коммит), чат.jsx/contacts.jsx перечитывают своё состояние при изменении.
+export const messagingActivity = signal(0);
+
+export function bumpMessagingActivity() {
+	messagingActivity.value++;
+}
+
+// НАЙДЕНО РЕАЛЬНЫМ ИСПОЛЬЗОВАНИЕМ (не домысел): .toArray() без фильтра возвращал ЧАТЫ
+// ВСЕХ локальных аккаунтов на этом устройстве, не только текущего ownerPubkey — второй
+// локальный аккаунт (мультиаккаунт, этап 11) видел чужую переписку в списке диалогов.
+// Этап 56 (найдено живой проверкой) — переписка, полученная ТОЛЬКО через
+// зеркалирование с другого устройства (syncMirroredHistory, этап 25), пишет
+// напрямую в messages, не создавая mlsGroups на этом устройстве (та появляется
+// лишь при первой ОТПРАВКЕ, ensureChatEstablished) — без объединения с messages
+// такая переписка была видна через "Контакты", но не в списке "Сообщения".
+export async function listChatPartners(ownerPubkey, dbKey) {
+	const groupRows = await db.table("mlsGroups").where("ownerPubkey").equals(ownerPubkey).toArray();
+	const fromGroups = groupRows.map((r) => fromEncryptedRow(r, dbKey).contactPubkey);
+	const messageRows = await db.table("messages").where("ownerPubkey").equals(ownerPubkey).toArray();
+	const fromMessages = messageRows.map((r) => r.chatId);
+	return [...new Set([...fromGroups, ...fromMessages])];
+}
+
+// Находка 3 (CONTRACTS.md, этап 27): ensureChatEstablished не подписывает устройство
+// на #h новой группы само — refreshGroupMessageSubscription обязана вызываться следом,
+// безусловно на каждую отправку (идемпотентна — дешевле, чем проверять "было ли создано").
+// attachments (этап 29, массив — этап B, MEDIA-SPEC.md §3.7) — необязательный, проброс в sendMessage как есть.
+export async function sendChatMessageAction(
+	ownerPubkey,
+	privKey,
+	dbKey,
+	contactPubkey,
+	text,
+	lamportTs,
+	publish,
+	fetchDeviceKeyPackages,
+	refreshGroupMessageSubscription,
+	attachments,
+	extra,
+) {
+	// Этап 1 (MESSAGE-DELIVERY-TZ.md, З1.1/З1.3, вариант A) — msgId/sentAt рождаются
+	// ЗДЕСЬ, ДО любого сетевого вызова (ensureChatEstablished может уйти в сеть за
+	// KeyPackage'ами контакта — на этом самом REQ/EOSE поймана H3, MESSAGE-DELIVERY-
+	// AUDIT-BRIEFING.md), и строка немедленно пишется в messages со статусом
+	// "queued" — лента показывает сообщение СРАЗУ, независимо от того, что
+	// произойдёт дальше (успех, awaiting_committer, зависший REQ). Раньше msgId
+	// рождался внутри doSendMessage — уже ПОСЛЕ того, как отправка могла уйти в
+	// очередь (И3/И4) или зависнуть без обратной связи для пользователя.
+	const msgId = bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+	const sentAt = Math.floor(Date.now() / 1000);
+	await upsertMessage(
+		{
+			ownerPubkey,
+			chatId: contactPubkey,
+			lamportTs,
+			senderPubkey: ownerPubkey,
+			id: "",
+			text,
+			status: "queued",
+			msgId,
+			sentAt,
+			...(attachments !== undefined && attachments.length > 0 ? { attachments } : {}),
+			...(sanitizeReplyTo(extra?.replyTo) ? { replyTo: sanitizeReplyTo(extra.replyTo) } : {}),
+		},
+		dbKey,
+	);
+	traceDelivery("message.upsert", { msgId, status: "queued" });
+	// Даже до установления переписки — реальное локальное действие пользователя
+	// прямо сейчас (тот же принцип, что в chat.js doSendMessage при failed).
+	await touchChatActivity(ownerPubkey, dbKey, contactPubkey, ownerPubkey, sentAt);
+
+	// Этап 73.3 — И3/И4: ensureChatEstablished бросает DomainError с
+	// key="errors.awaitingSiblingSync" (И4 — другое моё устройство уже
+	// разговаривало с этим контактом) или "errors.awaitingCommitter" (И3 —
+	// коммиттер этой пары не я) вместо создания второй независимой группы.
+	// Обе причины — ОДНА и та же реакция: сообщение остаётся "queued" в очереди,
+	// статус для UI. Строка в messages НЕ трогается — уже видна пользователю.
+	try {
+		await ensureChatEstablished(ownerPubkey, privKey, dbKey, contactPubkey, publish, fetchDeviceKeyPackages);
+	} catch (e) {
+		if (!e.key?.startsWith("errors.awaiting")) throw e;
+		// Этап 4 (MESSAGE-DELIVERY-TZ.md, вариант A) — "errors.awaitingCommitter"
+		// (И3, chat.js): коммиттер этой пары — контакт, не я, и молчит. Раньше
+		// единственный триггер для него был "сам напишет" — часы/дни/никогда,
+		// если человек не заходит. Пингуем его gift-wrap'ом (best-effort, не
+		// блокирует постановку в очередь ниже — сигнал может не дойти, drain
+		// после ЛЮБОГО другого пути установления группы всё равно сработает).
+		// НЕ для "errors.awaitingSiblingSync" (И4) — там блокер не контакт, а
+		// МОЁ ЖЕ другое устройство, пинговать контакт бессмысленно.
+		// Только на ПЕРВОЕ сообщение, ушедшее в очередь для этого контакта —
+		// иначе каждое следующее сообщение при офлайн-коммиттере слало бы ещё
+		// один gift-wrap, а он не читает их быстрее от повторов.
+		if (e.key === "errors.awaitingCommitter") {
+			const alreadyQueued = (await db.table("pendingOutgoingMessages").where("[ownerPubkey+contactPubkey]").equals([ownerPubkey, contactPubkey]).count()) > 0;
+			if (!alreadyQueued) {
+				try {
+					await publish(nip59Wrap(buildChatOpenRequestRumor(), privKey, contactPubkey));
+					traceDelivery("chat.open.request.sent", { contactPubkey });
+				} catch (pingErr) {
+					traceDelivery("chat.open.request.failed", { contactPubkey, reason: String(pingErr?.message ?? pingErr) });
+				}
+			}
+		}
+		await enqueuePendingOutgoingMessage(ownerPubkey, dbKey, { contactPubkey, lamportTs, msgId });
+		return { status: "awaiting_committer", msgId };
+	}
+	await refreshGroupMessageSubscription(ownerPubkey, privKey, dbKey, publish);
+	return sendMessage(ownerPubkey, privKey, dbKey, contactPubkey, text, lamportTs, publish, attachments, msgId, sentAt, extra);
+}
+
+// Этап 4 (MESSAGE-DELIVERY-TZ.md, вариант C) — "ручная кнопка отправить
+// приглашение ещё раз": автоматический пинг (sendChatMessageAction выше)
+// уходит РОВНО один раз на первое сообщение очереди — если коммиттер всё
+// ещё не в сети/не увидел его, пользователь может явно попросить повторить,
+// не дожидаясь ничего. Та же рассылка (kind 3012), не kind 3004 (ТЗ спутал
+// с CONTACT_ACCEPTED_KIND — не относится к установлению чата вовсе).
+export async function resendChatOpenRequestAction(privKey, contactPubkey, publish) {
+	await publish(nip59Wrap(buildChatOpenRequestRumor(), privKey, contactPubkey));
+}
+
+export async function deleteChatMessageAction(ownerPubkey, privKey, dbKey, contactPubkey, msgId, lamportTs, publish) {
+	return deleteMessage(ownerPubkey, privKey, dbKey, contactPubkey, msgId, lamportTs, publish);
+}
+
+// "Удалить у себя" — локально, без публикации (см. CONTRACTS.md, этап 27-довесок-5).
+export async function deleteMessageForMeAction(ownerPubkey, contactPubkey, msgId) {
+	return deleteMessageForMe(ownerPubkey, contactPubkey, msgId);
+}
+
+// "Очистить переписку" — локально, у собеседника всё остаётся (mlsGroups не трогается).
+export async function clearChatHistoryAction(ownerPubkey, contactPubkey) {
+	return clearChatHistory(ownerPubkey, contactPubkey);
+}
+
+// «Удалить переписку навсегда» (вместе с удалением контакта) — локально, на этом устройстве.
+// refreshGroupMessageSubscription передаётся вызывающим (как везде здесь): набор групп, за
+// которыми следит live-подписка, только что уменьшился.
+export async function deleteChatForeverAction(ownerPubkey, privKey, dbKey, contactPubkey, publish, refreshGroupMessageSubscription) {
+	const result = await deleteChatForever(ownerPubkey, dbKey, contactPubkey);
+	if (typeof refreshGroupMessageSubscription === "function") {
+		await refreshGroupMessageSubscription(ownerPubkey, privKey, dbKey, publish).catch(() => {});
+	}
+	bumpMessagingActivity();
+	return result;
+}
+
+// Реакция (или снятие своей: emojiId === null) — domain/messaging/reactions.js.
+export async function reactChatMessageAction(ownerPubkey, privKey, dbKey, contactPubkey, msgId, emojiId, lamportTs, publish) {
+	return reactToMessage(ownerPubkey, privKey, dbKey, contactPubkey, msgId, emojiId, lamportTs, publish);
+}
+
+// Редактирование — этап 27-довесок-6, DESIGN.md (LWW-инвариант).
+export async function editChatMessageAction(ownerPubkey, privKey, dbKey, contactPubkey, msgId, newText, lamportTs, publish) {
+	return editMessage(ownerPubkey, privKey, dbKey, contactPubkey, msgId, newText, lamportTs, publish);
+}
+
+export async function markChatReadAction(ownerPubkey, privKey, dbKey, contactPubkey, lastReadLamportTs, publish) {
+	return markChatAsRead(ownerPubkey, privKey, dbKey, contactPubkey, lastReadLamportTs, publish);
+}
+
+export async function saveChatDraftAction(ownerPubkey, privKey, dbKey, contactPubkey, text, publish) {
+	return saveDraft(ownerPubkey, privKey, dbKey, contactPubkey, text, publish);
+}

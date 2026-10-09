@@ -1,0 +1,327 @@
+import { useState, useEffect, useRef } from "preact/hooks";
+import { npubEncode } from "nostr-tools/nip19";
+import { shortPubkey } from "../format.js";
+import { getProfile, updateProfile } from "../../core/crypto/keystore.js";
+import { buildProfileEvent, uploadAvatarBlob } from "../../domain/identity/profile.js";
+import { resizeAvatarBlob } from "../../domain/identity/avatar-resize.js";
+import { getManifest, getRange } from "../../domain/files/content.js";
+import { currentUser, privKeySig, dbKeySig } from "../signals/auth.js";
+import { ensureConnected, publish } from "../signals/transport.js";
+import { projected, getFileKeyFor } from "../signals/files.js";
+import { loadUiSettings } from "../../domain/settings/ui-settings.js";
+import Screen from "../components/screen.jsx";
+import FilePicker from "../components/file-picker.jsx";
+import DeleteAccountPanel from "../components/delete-account-panel.jsx";
+import { bumpProfileActivity } from "../signals/profile.js";
+import IconCopy from "../icons/copy.jsx";
+import { t, errorMessage } from "../signals/i18n.js";
+import { uploadTarget } from "../../domain/files/servers.js";
+
+
+const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+
+function readFileAsDataUrl(file) {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => resolve(reader.result);
+		reader.onerror = () => reject(reader.error);
+		reader.readAsDataURL(file);
+	});
+}
+
+export default function Profile() {
+	const id = currentUser.value.id;
+	const login = currentUser.value.login;
+
+	const [loading, setLoading] = useState(true);
+	const [avatar, setAvatar] = useState("");
+	const [avatarUrl, setAvatarUrl] = useState("");
+	const [bio, setBio] = useState("");
+	const [savedBio, setSavedBio] = useState("");
+	const [bioStatus, setBioStatus] = useState("");
+	const [publishStatus, setPublishStatus] = useState("");
+	const [avatarError, setAvatarError] = useState("");
+	const [avatarPickerOpen, setAvatarPickerOpen] = useState(false);
+	const [copyStatus, setCopyStatus] = useState("");
+	const statusTimerRef = useRef(null);
+	const copyTimerRef = useRef(null);
+
+	useEffect(() => {
+		(async () => {
+			const profile = await getProfile(id);
+			setAvatar(profile.avatar);
+			setAvatarUrl(profile.avatarUrl);
+			setBio(profile.bio);
+			setSavedBio(profile.bio);
+			setLoading(false);
+		})();
+		return () => {
+			clearTimeout(statusTimerRef.current);
+			clearTimeout(copyTimerRef.current);
+		};
+	}, [id]);
+
+	async function handleCopyNpub() {
+		try {
+			await navigator.clipboard.writeText(npubEncode(id));
+			setCopyStatus(t("profile.copiedStatus"));
+		} catch {
+			setCopyStatus(t("profile.copyFailedStatus"));
+		}
+		clearTimeout(copyTimerRef.current);
+		copyTimerRef.current = setTimeout(() => setCopyStatus(""), 2000);
+	}
+
+	// Общий хвост обоих источников аватара (с диска/из хранилища) — публикация
+	// ПУБЛИЧНОЙ незашифрованной копии (этап 37) + republish kind 0. Best-effort
+	// (та же философия, что handleBioSubmit): локальное превью/кэш НЕ зависит
+	// от публикации.
+	async function publishAvatarBytes(fileBytes, mimeType) {
+		setPublishStatus(t("profile.publishingStatus"));
+		try {
+			await loadUiSettings(id, dbKeySig.value);
+			const serverUrl = uploadTarget();
+			if (!serverUrl) {
+				setPublishStatus(t("profile.notPublishedNoBlossom"));
+				return;
+			}
+			await ensureConnected(id, privKeySig.value, dbKeySig.value);
+			const url = await uploadAvatarBlob(serverUrl, fileBytes, mimeType, privKeySig.value);
+			// Персистируем ПУБЛИЧНЫЙ URL отдельно от dataUrl-превью (этап 38-довесок) —
+			// без этого handleBioSubmit не смогла бы включить picture в свой republish
+			// и молча стирала бы уже опубликованный аватар при следующем сохранении био.
+			setAvatarUrl(url);
+			await updateProfile(id, { avatarUrl: url });
+			// savedBio (не текущий черновик bio) — republish не должен затирать уже
+			// опубликованное био незасабмиченным черновиком в поле ввода.
+			const event = buildProfileEvent(privKeySig.value, { name: login, about: savedBio, picture: url });
+			const result = await publish(event);
+			setPublishStatus(result.ok ? "" : t("profile.notPublishedReason", { reason: result.reason || t("profile.relayRejected") }));
+		} catch (err) {
+			setPublishStatus(t("profile.notPublishedReason", { reason: errorMessage(err) }));
+		}
+	}
+
+	async function handleAvatarChange(e) {
+		const input = e.currentTarget;
+		const file = input.files?.[0];
+		if (!file) return;
+		if (!file.type.startsWith("image/")) {
+			setAvatarError(t("profile.selectImageError"));
+			input.value = "";
+			return;
+		}
+		if (file.size > MAX_AVATAR_BYTES) {
+			setAvatarError(t("profile.fileTooLargeError"));
+			input.value = "";
+			return;
+		}
+		setAvatarError("");
+		input.value = "";
+		// Ресайз ДО превью/публикации (FILES-FIX-SPEC.md §9.1) — то, что видит
+		// пользователь локально, обязано совпадать с тем, что уйдёт на сервер.
+		// Отказ ресайза (например, createImageBitmap недоступен) — best-effort:
+		// публикуем оригинал, не блокируем пользователя жёсткой ошибкой ради
+		// оптимизации размера.
+		let avatarBlob = file;
+		try {
+			avatarBlob = await resizeAvatarBlob(file);
+		} catch {
+			// оставляем оригинал
+		}
+		const dataUrl = await readFileAsDataUrl(avatarBlob);
+		setAvatar(dataUrl);
+		await updateProfile(id, { avatar: dataUrl });
+		bumpProfileActivity();
+		const fileBytes = new Uint8Array(await avatarBlob.arrayBuffer());
+		await publishAvatarBytes(fileBytes, avatarBlob.type || file.type);
+	}
+
+	// И7 7.2 — аватар ИЗ ХРАНИЛИЩА (FilePicker, §5.7 TASK.md). В отличие от
+	// "Заменить" (файл с диска, никогда не был приватным), файл ИЗ "Файлы"
+	// сейчас зашифрован — становясь аватаром, он публикуется НЕЗАШИФРОВАННЫМ
+	// НАВСЕГДА (решение №8 TASK.md, §7: "изображение станет общедоступным
+	// незашифрованным"). window.confirm() — то же решение, что необратимые
+	// действия в files.jsx (Удалить/unmountShare, этап 53 И3/И6) — простой
+	// нативный диалог, не кастомная модалка ради одного текста.
+	async function handleAvatarFromStorage([nodeId]) {
+		setAvatarPickerOpen(false);
+		setAvatarError("");
+		const node = projected.value.nodes.get(nodeId);
+		if (!node || node.kind !== "file") return;
+		try {
+			const manifest = await getManifest(node.blob, { serverUrl: uploadTarget() });
+			if (!manifest.mime?.startsWith("image/")) {
+				setAvatarError(t("profile.selectImageError"));
+				return;
+			}
+			if (manifest.size > MAX_AVATAR_BYTES) {
+				setAvatarError(t("profile.fileTooLargeError"));
+				return;
+			}
+			const fileKey = await getFileKeyFor(node.blob);
+			if (!fileKey) {
+				setAvatarError(t("chat.window.fileKeyNotFoundError"));
+				return;
+			}
+			if (!window.confirm(t("profile.avatarPublicConfirm"))) return;
+			const bytes = await getRange(manifest, fileKey, 0, manifest.size, { serverUrl: uploadTarget() });
+			let avatarBlob = new Blob([bytes], { type: manifest.mime });
+			try {
+				avatarBlob = await resizeAvatarBlob(avatarBlob);
+			} catch {
+				// оставляем оригинал
+			}
+			const dataUrl = await new Promise((resolve, reject) => {
+				const reader = new FileReader();
+				reader.onload = () => resolve(reader.result);
+				reader.onerror = () => reject(reader.error);
+				reader.readAsDataURL(avatarBlob);
+			});
+			setAvatar(dataUrl);
+			await updateProfile(id, { avatar: dataUrl });
+			bumpProfileActivity();
+			const avatarBytes = new Uint8Array(await avatarBlob.arrayBuffer());
+			await publishAvatarBytes(avatarBytes, avatarBlob.type || manifest.mime);
+		} catch (err) {
+			setAvatarError(errorMessage(err));
+		}
+	}
+
+	async function handleBioSubmit(e) {
+		e.preventDefault();
+		await updateProfile(id, { bio });
+		bumpProfileActivity();
+		setSavedBio(bio);
+		setBioStatus(t("profile.savedStatus"));
+		clearTimeout(statusTimerRef.current);
+		statusTimerRef.current = setTimeout(() => setBioStatus(""), 2000);
+
+		// Локальное сохранение НЕ зависит от публикации (профиль в этом экране —
+		// keystore-запись, не fold из журнала событий, в отличие от contacts/groups) —
+		// публикация в relay отдельный, best-effort шаг: другие пользователи видят
+		// никнейм/био через kind 0 (F-CT-04), но офлайн-редактирование остаётся рабочим.
+		setPublishStatus(t("profile.publishingStatus"));
+		try {
+			await ensureConnected(id, privKeySig.value, dbKeySig.value);
+			// avatarUrl (этап 38-довесок, найденный реальным использованием баг): БЕЗ
+			// него этот republish стирал бы уже опубликованный аватар — kind 0
+			// replaceable, отсутствие поля в новой версии = "поля больше нет".
+			const event = buildProfileEvent(privKeySig.value, { name: login, about: bio, picture: avatarUrl || undefined });
+			const result = await publish(event);
+			setPublishStatus(result.ok ? "" : t("profile.notPublishedReason", { reason: result.reason || t("profile.relayRejected") }));
+		} catch (err) {
+			setPublishStatus(t("profile.notPublishedReason", { reason: errorMessage(err) }));
+		}
+	}
+
+	if (loading) {
+		return (
+			<Screen title={t("nav.profile")}>
+				<p style={{ color: "var(--muted)" }}>{t("profile.loadingTitle")}</p>
+			</Screen>
+		);
+	}
+
+	const initial = (login || "?").trim().charAt(0).toUpperCase() || "?";
+	const bioIsDirty = bio !== savedBio;
+
+	return (
+		// Живой фидбек: в шапке было только имя — на экране, где меняют
+		// аватар/био/ключ/видимость, непонятно, что именно сейчас открыто
+		// (в приложении несколько таких личных экранов). {{имя}}: {{раздел}}
+		// — тот же приём просят применить и на "Ключ и восстановление"
+		// (security.jsx), и на "Файлы" (files.jsx).
+		<Screen title={`${login || t("profile.noNameFallback")}: ${t("sidebarCard.menuProfile")}`}>
+			<div class="profile-page stack">
+				{/* Макет 0teqm.jpg: фото-герой 16:9, под ним ссылки «сменить», ниже
+				    поля-карточки (идентификатор, о себе) и в самом низу — удаление. */}
+				<section class="profile-photo stack">
+					<div class="profile-hero">
+						{/* Приоритет avatar || avatarUrl НЕ менять — см. комментарий
+						    этапа 74 в истории файла: корректность обеспечивает
+						    инвалидация в hydrateOwnProfile, а не порядок здесь. */}
+						{avatar || avatarUrl ? (
+							<img src={avatar || avatarUrl} alt="" class="profile-avatar-square" />
+						) : (
+							<div
+								role="img"
+								aria-label={t("profile.avatarNotSetAria")}
+								class="profile-avatar-square profile-avatar-square-fallback row"
+								style={{ "--align": "center", justifyContent: "center" }}
+							>
+								{initial}
+							</div>
+						)}
+					</div>
+					<div class="profile-photo__actions">
+						<label for="profile-avatar-input" class="link-btn">
+							{t("profile.replaceAvatarLabel")}
+						</label>
+						<input id="profile-avatar-input" class="visually-hidden" type="file" accept="image/*" onChange={handleAvatarChange} />
+						<button type="button" class="link-btn" onClick={() => setAvatarPickerOpen(true)}>
+							{t("profile.chooseFromStorageButton")}
+						</button>
+					</div>
+					{avatarError && (
+						<p role="alert" class="callout callout--bad">
+							{avatarError}
+						</p>
+					)}
+				</section>
+
+				{avatarPickerOpen && (
+					<FilePicker predicate={(node) => node.kind === "file"} multiple={false} onSelect={handleAvatarFromStorage} onCancel={() => setAvatarPickerOpen(false)} />
+				)}
+
+				<form class="profile-fields stack" onSubmit={handleBioSubmit}>
+					<div class="field-card">
+						<span class="field-card__label">{t("profile.identifierHeading")}</span>
+						<div class="field-card__row">
+							<code class="field-card__value" title={npubEncode(id)}>
+								{shortPubkey(id)}
+							</code>
+							<button type="button" class="icon-btn rigid" onClick={handleCopyNpub} aria-label={t("profile.copyKeyAria")}>
+								<IconCopy />
+							</button>
+						</div>
+						{copyStatus && (
+							<p role="status" class="field-card__hint">
+								{copyStatus}
+							</p>
+						)}
+						<p class="field-card__hint">{t("profile.identifierHint")}</p>
+					</div>
+
+					<div class="field-card">
+						<label class="field-card__label" for="profile-bio">
+							{t("profile.aboutMeLegend")}
+						</label>
+						<textarea id="profile-bio" rows="4" value={bio} onInput={(e) => setBio(e.currentTarget.value)} />
+						<div class="field-card__foot">
+							{bioStatus && (
+								<span role="status" class="field-card__hint">
+									{bioStatus}
+								</span>
+							)}
+							{publishStatus && (
+								<span role="status" class="field-card__hint">
+									{publishStatus}
+								</span>
+							)}
+							<button type="submit" class="link-btn" disabled={!bioIsDirty}>
+								{t("common.save")}
+							</button>
+						</div>
+					</div>
+				</form>
+
+				{/* Переехало из "Настроек": удаление относится к тому, КТО ты, а
+				    не к тому, как ведёт себя приложение. */}
+				<section class="profile-danger stack" style={{ "--gap": "var(--space-s)" }} aria-label={t("settings.dangerZoneTitle")}>
+					<DeleteAccountPanel ownerPubkey={id} login={login} privKey={privKeySig.value} dbKey={dbKeySig.value} />
+				</section>
+			</div>
+		</Screen>
+	);
+}

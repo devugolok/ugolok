@@ -1,0 +1,308 @@
+export function reduce(peerState, event) {
+  const now = Math.floor(Date.now() / 1000);
+
+  switch (peerState.name) {
+    case "NONE":
+      if (event.type === "USER_SEND_REQUEST") {
+        return {
+          state: { ...peerState, name: "OUTGOING_PENDING", sentAt: now },
+          commands: [
+            { type: "PUBLISH_REQUEST", peer: event.peer, greeting: event.greeting },
+            { type: "UPSERT", peer: event.peer, fields: { sentAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "OUTGOING_PENDING" },
+          ],
+        };
+      }
+      if (event.type === "REMOTE_REQUEST") {
+        // I1 (redelivery-safety) и для NONE: после «удалить контакт»/«отклонили»/«отменили»
+        // строка остаётся с resolvedAt — старая заявка того же человека, которую relay
+        // передоставляет при перезапуске, НЕ должна воскрешать «Входящие» и уведомление.
+        // Свежая заявка (createdAt > resolvedAt) проходит как обычно.
+        if (event.createdAt <= (peerState.resolvedAt || 0)) {
+          return { state: peerState, commands: [] };
+        }
+        return {
+          state: { ...peerState, name: "INCOMING_PENDING", greeting: event.greeting, resolvedAt: peerState.resolvedAt || 0 },
+          commands: [
+            { type: "UPSERT", peer: event.peer, fields: { greeting: event.greeting, createdAt: event.createdAt } },
+            { type: "LOG_JOURNAL", entry: { peer: event.peer, category: "newRequest", message: "прислал(а) вам заявку в контакты", createdAt: event.createdAt } },
+            { type: "EMIT", peer: event.peer, stateName: "INCOMING_PENDING" },
+          ],
+        };
+      }
+      if (event.type === "USER_BLOCK") {
+        return {
+          state: { ...peerState, name: "BLOCKED", resolvedAt: now },
+          commands: [
+            { type: "UPDATE_MUTE_LIST", peer: event.peer, action: "add" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "BLOCKED" },
+          ],
+        };
+      }
+      break;
+
+    case "OUTGOING_PENDING":
+      if (event.type === "REMOTE_ACCEPT" && event.createdAt > peerState.resolvedAt) {
+        return {
+          state: { ...peerState, name: "CONTACT", resolvedAt: event.createdAt },
+          commands: [
+            { type: "UPDATE_CONTACTS_LIST", peer: event.peer, action: "add" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: event.createdAt } },
+            { type: "LOG_JOURNAL", entry: { peer: event.peer, category: "accepted", message: "принял(а) вашу заявку", createdAt: event.createdAt } },
+            { type: "EMIT", peer: event.peer, stateName: "CONTACT" },
+          ],
+        };
+      }
+      if (event.type === "REMOTE_REJECT" && event.createdAt > peerState.resolvedAt) {
+        return {
+          state: { ...peerState, name: "NONE", resolvedAt: event.createdAt },
+          commands: [
+            { type: "DELETE", peer: event.peer },
+            { type: "LOG_JOURNAL", entry: { peer: event.peer, category: "rejected", message: "отклонил(а) вашу заявку", createdAt: event.createdAt } },
+            { type: "EMIT", peer: event.peer, stateName: "NONE" },
+          ],
+        };
+      }
+      if (event.type === "REMOTE_REQUEST" && event.createdAt > peerState.resolvedAt) {
+        return {
+          state: { ...peerState, name: "CONTACT", resolvedAt: event.createdAt },
+          commands: [
+            { type: "UPDATE_CONTACTS_LIST", peer: event.peer, action: "add" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: event.createdAt } },
+            { type: "LOG_JOURNAL", entry: { peer: event.peer, category: "crossed", message: "вы теперь контакты — заявки совпали", createdAt: event.createdAt } },
+            { type: "EMIT", peer: event.peer, stateName: "CONTACT" },
+          ],
+        };
+      }
+      if (event.type === "USER_CANCEL") {
+        return {
+          state: { ...peerState, name: "NONE" },
+          commands: [
+            { type: "PUBLISH_CANCEL", peer: event.peer },
+            { type: "DELETE", peer: event.peer },
+            { type: "EMIT", peer: event.peer, stateName: "NONE" },
+          ],
+        };
+      }
+      if (event.type === "USER_BLOCK") {
+        return {
+          state: { ...peerState, name: "BLOCKED", resolvedAt: now },
+          commands: [
+            { type: "PUBLISH_CANCEL", peer: event.peer },
+            { type: "UPDATE_MUTE_LIST", peer: event.peer, action: "add" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "BLOCKED" },
+          ],
+        };
+      }
+      break;
+
+    case "INCOMING_PENDING":
+      if (event.type === "USER_ACCEPT") {
+        return {
+          state: { ...peerState, name: "CONTACT", resolvedAt: now },
+          commands: [
+            { type: "PUBLISH_ACCEPT", peer: event.peer },
+            { type: "UPDATE_CONTACTS_LIST", peer: event.peer, action: "add" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "CONTACT" },
+          ],
+        };
+      }
+      if (event.type === "USER_SEND_REQUEST") {
+        return {
+          state: { ...peerState, name: "CONTACT", resolvedAt: now },
+          commands: [
+            { type: "PUBLISH_ACCEPT", peer: event.peer },
+            { type: "UPDATE_CONTACTS_LIST", peer: event.peer, action: "add" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "CONTACT" },
+          ],
+        };
+      }
+      if (event.type === "USER_REJECT") {
+        return {
+          state: { ...peerState, name: "REJECTED_BY_ME", resolvedAt: now },
+          commands: [
+            { type: "PUBLISH_REJECT", peer: event.peer },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "REJECTED_BY_ME" },
+          ],
+        };
+      }
+      if (event.type === "USER_BLOCK") {
+        return {
+          state: { ...peerState, name: "BLOCKED", resolvedAt: now },
+          commands: [
+            { type: "UPDATE_MUTE_LIST", peer: event.peer, action: "add" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "BLOCKED" },
+          ],
+        };
+      }
+      if (event.type === "REMOTE_CANCEL" && event.createdAt > peerState.resolvedAt) {
+        return {
+          state: { ...peerState, name: "NONE", resolvedAt: event.createdAt },
+          commands: [
+            { type: "DELETE", peer: event.peer },
+            { type: "EMIT", peer: event.peer, stateName: "NONE" },
+          ],
+        };
+      }
+      if (event.type === "REMOTE_REQUEST" && event.createdAt > peerState.resolvedAt) {
+        return {
+          state: { ...peerState, greeting: event.greeting, resolvedAt: event.createdAt },
+          commands: [
+            { type: "UPSERT", peer: event.peer, fields: { greeting: event.greeting, createdAt: event.createdAt } },
+            { type: "EMIT", peer: event.peer, stateName: "INCOMING_PENDING" },
+          ],
+        };
+      }
+      break;
+
+    case "CONTACT":
+      if (event.type === "REMOTE_REQUEST") {
+        // Найдено живой проверкой (native/Android, чек-лист §6): разблокировка
+        // сбрасывает МОЁ состояние в NONE, но ничего не сообщает собеседнику —
+        // блокировка по конструкции односторонняя (§1.1 CONTACTS-FSM.md), он
+        // остаётся CONTACT. Повторная заявка после этого молча отбрасывалась
+        // (I2 трактовала ЛЮБОЙ REMOTE_REQUEST как безусловный игнор) —
+        // отправитель зависал в OUTGOING_PENDING навсегда, собеседник никогда
+        // не видел заявку и нечего было принимать. Тот же симптом даёт ЛЮБАЯ
+        // причина, по которой СОБЕСЕДНИК потерял общее состояние (переустановка,
+        // восстановление по мнемонике на новом устройстве, потерянная IndexedDB) —
+        // не только разблокировка. Правило одно: заявка от того, кто уже мой
+        // контакт, означает "собеседник потерял наше состояние", отвечаем
+        // автоматически (согласие уже было дано однажды).
+        //
+        // I1-гейт (createdAt <= resolvedAt) — та же защита от повторной доставки,
+        // что у остальных состояний: giftWrapSubscriber (transport.js) не имеет
+        // since-фильтра, а isNewEvent — in-memory, не переживает reload/reconnect
+        // (см. её же комментарий) — без гейта по времени PUBLISH_ACCEPT слался бы
+        // заново на КАЖДЫЙ повторный вход, пока исходное событие живёт на relay.
+        // resolvedAt продвигается вперёд на принятом событии — тот же приём, что
+        // OUTGOING_PENDING/INCOMING_PENDING уже используют для своих I1-переходов.
+        if (event.createdAt <= peerState.resolvedAt) {
+          return { state: peerState, commands: [] };
+        }
+        return {
+          state: { ...peerState, resolvedAt: event.createdAt },
+          commands: [
+            { type: "PUBLISH_ACCEPT", peer: event.peer },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: event.createdAt } },
+          ],
+        };
+      }
+      if (event.type === "USER_REMOVE_CONTACT") {
+        return {
+          state: { ...peerState, name: "NONE", resolvedAt: now },
+          commands: [
+            { type: "UPDATE_CONTACTS_LIST", peer: event.peer, action: "remove" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "NONE" },
+          ],
+        };
+      }
+      if (event.type === "USER_BLOCK") {
+        return {
+          state: { ...peerState, name: "BLOCKED", resolvedAt: now },
+          commands: [
+            { type: "UPDATE_CONTACTS_LIST", peer: event.peer, action: "remove" },
+            { type: "UPDATE_MUTE_LIST", peer: event.peer, action: "add" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "BLOCKED" },
+          ],
+        };
+      }
+      break;
+
+    case "REJECTED_BY_ME":
+      if (event.type === "REMOTE_REQUEST" && event.createdAt > peerState.resolvedAt) {
+        return {
+          state: { ...peerState, name: "INCOMING_PENDING", greeting: event.greeting, resolvedAt: peerState.resolvedAt },
+          commands: [
+            { type: "UPSERT", peer: event.peer, fields: { greeting: event.greeting, createdAt: event.createdAt } },
+            { type: "EMIT", peer: event.peer, stateName: "INCOMING_PENDING" },
+          ],
+        };
+      }
+      if (event.type === "USER_SEND_REQUEST") {
+        return {
+          state: { ...peerState, name: "OUTGOING_PENDING", sentAt: now },
+          commands: [
+            { type: "PUBLISH_REQUEST", peer: event.peer, greeting: event.greeting },
+            { type: "UPSERT", peer: event.peer, fields: { sentAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "OUTGOING_PENDING" },
+          ],
+        };
+      }
+      if (event.type === "USER_BLOCK") {
+        return {
+          state: { ...peerState, name: "BLOCKED", resolvedAt: now },
+          commands: [
+            { type: "PUBLISH_CANCEL", peer: event.peer },
+            { type: "UPDATE_MUTE_LIST", peer: event.peer, action: "add" },
+            { type: "UPSERT", peer: event.peer, fields: { resolvedAt: now } },
+            { type: "EMIT", peer: event.peer, stateName: "BLOCKED" },
+          ],
+        };
+      }
+      break;
+
+    case "BLOCKED":
+      if (event.type === "USER_UNBLOCK") {
+        return {
+          state: { ...peerState, name: "NONE" },
+          commands: [
+            { type: "UPDATE_MUTE_LIST", peer: event.peer, action: "remove" },
+            { type: "DELETE", peer: event.peer },
+            { type: "EMIT", peer: event.peer, stateName: "NONE" },
+          ],
+        };
+      }
+      break;
+
+    default:
+      return { state: peerState, commands: [] };
+  }
+
+  return { state: peerState, commands: [] };
+}
+
+export function reconcileList(relationships, listKind, pubkeySet, createdAt) {
+  const targetState = listKind === "contacts" ? "CONTACT" : "BLOCKED";
+  const newRelationships = new Map(relationships);
+  const commands = [];
+
+  // Этап 74 — найдено живой проверкой: симметрично ветке удаления ниже (I1) —
+  // старый снимок списка, доставленный ПОСЛЕ более свежего локального решения
+  // (например, USER_REMOVE_CONTACT), не должен вернуть уже удалённого peer'а.
+  // Актуально с появлением живой подписки на kind:3/10000 — разовый bootstrap-
+  // скан этой гонки не создавал (всегда применял единственный pickLatest-снимок).
+  for (const peer of pubkeySet) {
+    const existing = newRelationships.get(peer);
+    if ((!existing || existing.name !== targetState) && (!existing || existing.resolvedAt <= createdAt)) {
+      newRelationships.set(peer, {
+        name: targetState,
+        peerPubkey: peer,
+        resolvedAt: createdAt,
+        greeting: null,
+      });
+      commands.push({ type: "UPSERT", peer, fields: { resolvedAt: createdAt } });
+      commands.push({ type: "EMIT", peer, stateName: targetState });
+    }
+  }
+
+  for (const [peer, peerState] of relationships) {
+    if (peerState.name === targetState && !pubkeySet.has(peer)) {
+      if (peerState.resolvedAt <= createdAt) {
+        newRelationships.set(peer, { ...peerState, name: "NONE", resolvedAt: createdAt });
+        commands.push({ type: "DELETE", peer });
+        commands.push({ type: "EMIT", peer, stateName: "NONE" });
+      }
+    }
+  }
+
+  return { relationships: newRelationships, commands };
+}

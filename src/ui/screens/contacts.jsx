@@ -1,0 +1,831 @@
+import { Fragment } from "preact";
+import { useState, useEffect, useRef } from "preact/hooks";
+import { shortPubkey } from "../format.js";
+import { currentUser, privKeySig, dbKeySig } from "../signals/auth.js";
+import { ensureConnected, publish, fetchProfiles, refreshLiveProfileSubscription, refreshGroupMessageSubscription } from "../signals/transport.js";
+import { openChat, place } from "../signals/place.js";
+import { placeCall } from "../signals/call.js";
+import { notifyConnectionTrouble } from "../signals/connection-notice.js";
+import { deleteChatForeverAction } from "../signals/chats.js";
+import RemoveContactDialog from "../components/remove-contact-dialog.jsx";
+import ContactModal from "../components/contact-modal.jsx";
+import IconPhoneCall from "../icons/phone-call.jsx";
+import IconChatBubble from "../icons/chat-bubble.jsx";
+import IconPencil from "../icons/pencil.jsx";
+import IconTrash from "../icons/trash.jsx";
+import IconGear from "../icons/gear.jsx";
+import IconLockClosed from "../icons/lock-closed.jsx";
+import IconChevronRight from "../icons/chevron-right.jsx";
+import IconPlus from "../icons/plus.jsx";
+import IconPeople from "../icons/people.jsx";
+import IconMagnifyingGlass from "../icons/magnifying-glass.jsx";
+import ActionsMenu from "../components/actions-menu.jsx";
+import AddContactForm from "../components/add-contact-form.jsx";
+import { useDetailsMenu } from "../hooks/use-details-menu.js";
+import {
+	contacts,
+	blockedContacts,
+	outgoingRequests,
+	incomingRequests,
+	rejectedByMe,
+	groups,
+	profiles,
+	refreshAll,
+	refreshGroups,
+	ensureProfilesFetched,
+	refreshProfiles,
+	removeContactAction,
+	blockContactAction,
+	unblockContactAction,
+	createGroupAction,
+	renameGroupAction,
+	addGroupMemberAction,
+	removeGroupMemberAction,
+	deleteGroupAction,
+	sendContactRequestAction,
+	acceptContactRequestAction,
+	rejectContactRequestAction,
+	cancelContactRequestAction,
+} from "../signals/contacts.js";
+import PermissionEditor from "../components/permission-editor.jsx";
+import UserCard from "../components/user-card.jsx";
+import Screen from "../components/screen.jsx";
+import { t, errorMessage } from "../signals/i18n.js";
+
+// F-CT-04: показывает никнейм/аватар/био контакта, если профиль уже подтянут
+// (см. ensureProfilesFetched), иначе — усечённый npub как раньше. onClick, если
+// передан, делает аватар+имя ссылкой на чат (chat.jsx); в списке заблокированных
+// onClick не передаётся — просто отображение.
+//
+// PROCESS-DOCS/REDESIGN/USERCARD/USER-CARD.md — карточные места (лента
+// "Знакомств"/предпросмотр, все списки этого экрана) переехали на
+// UserCard (user-card.jsx); этот компонент остаётся ТОЛЬКО для мест,
+// где личность живёт внутри чужой кнопки (chat.jsx, два места) или
+// внутри SetRow (settings.jsx) — там UserCard дал бы вложенную кнопку
+// в кнопке. Проп decorated (тёплый фон для карточного контекста) ушёл
+// вместе с этим — здесь он больше никогда не был true.
+export function ContactIdentity({ pubkey, onClick, unreadCount }) {
+	const profile = profiles.value[pubkey];
+	const displayName = profile?.name || shortPubkey(pubkey);
+
+	// Аватар — в <figure> (самостоятельная медиа-единица: фото ЛИБО
+	// буква-заглушка, оба варианта — форма представления личности, не
+	// обязательно растровое изображение), не голый <img>. .contact-avatar
+	// (размер/рамка/радиус) не тронут — он же отдельно держит аватар
+	// канала в .ch-card (discovery.jsx), эта дорожка не задета.
+	const avatar = (
+		<figure class="contact-avatar-figure rigid">
+			{profile?.picture ? (
+				<img src={profile.picture} alt="" width="40" height="40" class="contact-avatar" />
+			) : (
+				<div aria-hidden="true" class="contact-avatar contact-avatar-fallback row" style={{ "--align": "center", justifyContent: "center" }}>
+					{(displayName || "?").trim().charAt(0).toUpperCase()}
+				</div>
+			)}
+		</figure>
+	);
+
+	// <div>, не <span> — блочный контейнер под .stack-раскладку (span
+	// как контейнер многострочной flex-колонки был багом разметки, не
+	// стилистикой). .grow — ест остаток строки (аватар рядом — .rigid).
+	const text = (
+		<div class="contact-info stack grow" style={{ "--gap": "var(--space-3xs)" }}>
+			<span class={profile?.name ? undefined : "contact-identity-npub"}>
+				{displayName}
+				{/* Список чатов (chat.jsx) — непрочитанные этого собеседника в квадратных
+				    скобках рядом с именем (пользователь), вместо отдельного бейджа справа. */}
+				{unreadCount > 0 && <span aria-label={t("chat.list.unreadAria", { count: unreadCount })}> [{unreadCount}]</span>}
+			</span>
+			{profile?.about && <small>{profile.about}</small>}
+		</div>
+	);
+
+	if (!onClick) {
+		return (
+			<div class="contact-identity row" style={{ "--gap": "var(--space-s)", "--align": "center" }}>
+				{avatar}
+				{text}
+			</div>
+		);
+	}
+
+	return (
+		<button
+			type="button"
+			onClick={onClick}
+			aria-label={t("contacts.openChatAria", { name: displayName })}
+			class="contact-identity contact-identity-btn row"
+			style={{ "--gap": "var(--space-s)", "--align": "center" }}
+		>
+			{avatar}
+			{text}
+		</button>
+	);
+}
+
+export default function Contacts() {
+	const ownerPubkey = currentUser.value.id;
+	const privKey = privKeySig.value;
+	const dbKey = dbKeySig.value;
+
+	const [newGroupName, setNewGroupName] = useState("");
+	const [groupError, setGroupError] = useState("");
+	const [selectedGroupIds, setSelectedGroupIds] = useState(() => new Set());
+	const [expandedPubkey, setExpandedPubkey] = useState(null);
+	const [renamingGroupId, setRenamingGroupId] = useState(null);
+	const [renameValue, setRenameValue] = useState("");
+	const [rowError, setRowError] = useState("");
+	const [busy, setBusy] = useState(false);
+	// Панель «Добавить», поиск по списку и форма новой группы раскрываются по
+	// кнопкам, а не занимают экран всегда (макет vqL6N.jpg): это только вид,
+	// данные и действия те же.
+	const [showAdd, setShowAdd] = useState(false);
+	const [showGroupForm, setShowGroupForm] = useState(false);
+	const [query, setQuery] = useState("");
+	const requestsRef = useRef(null);
+	// Диалог «Удалить контакт (и переписку?)» — {pubkey, name} или null.
+	const [removeTarget, setRemoveTarget] = useState(null);
+	// Карточка контакта (модальное окно) — pubkey открытого контакта или null.
+	const [cardPubkey, setCardPubkey] = useState(null);
+	// busyRef — синхронная защита от повторного входа. busy (state) обновляется через
+	// setBusy и коммитится АСИНХРОННО (рендер-цикл) — обработчик второго клика,
+	// вызванный до коммита, читает СТАРОЕ значение busy из замыкания того же рендера
+	// и гонку не ловит. Ref читается/пишется немедленно, синхронно с самим кликом.
+	const busyRef = useRef(false);
+
+	useEffect(() => {
+		refreshAll();
+		ensureConnected(ownerPubkey, privKey, dbKey)
+			.then(async () => {
+				refreshAll();
+				await refreshGroups(ownerPubkey, dbKey);
+				// именно здесь, не раньше: до этой точки fetchProfiles бросил бы
+				// (нет соединения). Экран открыт заново — refreshProfiles подтягивает
+				// СВЕЖИЕ данные (найденный баг: старое био/имя не обновлялись годами).
+				await refreshProfiles(contacts.value, fetchProfiles).catch(() => {});
+				// Найденный баг (пользователь, этап 27-довесок-7): без ЖИВОЙ подписки
+				// изменение профиля контакта не появлялось на уже открытом экране — нужно
+				// было уйти и вернуться (только тогда refreshProfiles вызывался заново).
+				await refreshLiveProfileSubscription(ownerPubkey).catch(() => {});
+			})
+			.catch(() => notifyConnectionTrouble());
+	}, [ownerPubkey]);
+
+	// F-CT-04, этап 49 — сигналы (contacts/incomingRequests/outgoingRequests/
+	// rejectedByMe) теперь реактивны САМИ ПО СЕБЕ (EMIT из contact-runtime.js на
+	// каждый переход состояния peer'а) — отдельный "messagingActivity"-триггер
+	// (было раньше, ручной перечитыватель Dexie-таблиц) больше не нужен, этот эффект
+	// просто подтягивает профили для любых новых pubkey, появившихся в любом разделе.
+	useEffect(() => {
+		const pubkeys = [
+			...contacts.value,
+			...incomingRequests.value.map((r) => r.peerPubkey),
+			...outgoingRequests.value.map((r) => r.peerPubkey),
+			...rejectedByMe.value.map((r) => r.peerPubkey),
+		];
+		if (pubkeys.length > 0) {
+			ensureProfilesFetched(pubkeys, fetchProfiles).catch(() => {});
+			// Новый контакт — переподписка (идемпотентно, тот же приём, что
+			// refreshGroupMessageSubscription на каждую отправку) подхватывает его в live-набор.
+			refreshLiveProfileSubscription(ownerPubkey).catch(() => {});
+		}
+	}, [contacts.value, incomingRequests.value, outgoingRequests.value, rejectedByMe.value]);
+
+	// «Заявки» в меню открывают этот же экран сразу на блоке входящих заявок.
+	useEffect(() => {
+		if (place.value.kind === "people" && place.value.section === "requests") {
+			requestsRef.current?.scrollIntoView({ block: "start" });
+		}
+	}, [place.value]);
+
+	async function handleAcceptContactRequest(peerPubkey) {
+		if (busyRef.current) return;
+		busyRef.current = true;
+		setRowError("");
+		setBusy(true);
+		try {
+			await acceptContactRequestAction(peerPubkey);
+		} catch (err) {
+			setRowError(errorMessage(err));
+		} finally {
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	async function handleRejectContactRequest(peerPubkey) {
+		if (busyRef.current) return;
+		busyRef.current = true;
+		setRowError("");
+		setBusy(true);
+		try {
+			await rejectContactRequestAction(peerPubkey);
+		} catch (err) {
+			setRowError(errorMessage(err));
+		} finally {
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	async function handleCreateGroup(e) {
+		e.preventDefault();
+		if (busyRef.current) return;
+		busyRef.current = true;
+		setGroupError("");
+		setBusy(true);
+		try {
+			await createGroupAction(ownerPubkey, privKey, dbKey, newGroupName, publish);
+			setNewGroupName("");
+		} catch (err) {
+			setGroupError(errorMessage(err));
+		} finally {
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	function groupsForContact(pubkey) {
+		return groups.value.filter((g) => g.memberPubkeys.includes(pubkey));
+	}
+
+	function toggleGroupFilter(groupId) {
+		setSelectedGroupIds((prev) => {
+			const next = new Set(prev);
+			if (next.has(groupId)) next.delete(groupId);
+			else next.add(groupId);
+			return next;
+		});
+	}
+
+	async function runRowAction(fn) {
+		if (busyRef.current) return;
+		busyRef.current = true;
+		setRowError("");
+		setBusy(true);
+		try {
+			await fn();
+		} catch (err) {
+			setRowError(errorMessage(err));
+		} finally {
+			busyRef.current = false;
+			setBusy(false);
+		}
+	}
+
+	// Контакты и заблокированные теперь СТРУКТУРНО взаимоисключающие (единая
+	// contactRelationships, один state на peer — этап 49, CONTACTS-FSM.md) —
+	// отдельный фильтр здесь больше не нужен.
+	const byGroup =
+		selectedGroupIds.size === 0
+			? contacts.value
+			: contacts.value.filter((pk) => groupsForContact(pk).some((g) => selectedGroupIds.has(g.id)));
+	const needle = query.trim().toLowerCase();
+	const visibleContacts = needle
+		? byGroup.filter((pk) => `${profiles.value[pk]?.name || ""} ${shortPubkey(pk)} ${pk}`.toLowerCase().includes(needle))
+		: byGroup;
+
+	// «Заявки» из меню — отдельный вид: только входящие заявки, без списка контактов.
+	const requestsOnly = place.value.kind === "people" && place.value.section === "requests";
+
+	return (
+		<Screen
+			title={requestsOnly ? t("shell.navRequests") : t("nav.contacts")}
+			actions={
+				requestsOnly ? undefined : (
+					<button type="button" class="btn-soft" aria-expanded={showAdd} onClick={() => setShowAdd((v) => !v)}>
+						{t("common.add")}
+					</button>
+				)
+			}
+		>
+			<div class="contacts-page stack">
+				{/* "Соединение: ..." переехало в постоянную панель под главным
+				    меню (app.jsx, ConnectionStatusPanel) — видна на любом экране,
+				    здесь дублировать незачем (пользователь, item 4). */}
+				{!requestsOnly && <p class="hint contacts-groups-intro">{t("contacts.groupsIntro")}</p>}
+
+				{!requestsOnly && showAdd && (
+					<div class="contacts-add-panel">
+						<AddContactForm autoFocus onSent={() => setShowAdd(false)} />
+					</div>
+				)}
+
+				{!requestsOnly && (
+				<div class="search-field row">
+					<IconMagnifyingGlass aria-hidden="true" />
+					<input type="search" aria-label={t("shell.searchLabel")} placeholder={t("shell.searchPlaceholder")} value={query} onInput={(e) => setQuery(e.currentTarget.value)} />
+				</div>
+				)}
+
+				{!requestsOnly && (
+				<section class="contact-groups stack" aria-labelledby="groups-heading">
+					<h2 id="groups-heading" class="visually-hidden">{t("contacts.groupsHeading")}</h2>
+					<ul role="list" class="contact-chips">
+						<li>
+							<span class="group-filter-chip">
+								<input
+									id="group-filter-all"
+									type="checkbox"
+									checked={selectedGroupIds.size === 0}
+									onChange={() => setSelectedGroupIds(new Set())}
+								/>
+								<label for="group-filter-all">{t("contacts.allGroupsLabel")}</label>
+							</span>
+						</li>
+						{groups.value.map((g) => (
+							<li key={g.id}>
+								<div class="group-filter-chip">
+									<input
+										id={`group-filter-${g.id}`}
+										type="checkbox"
+										checked={selectedGroupIds.has(g.id)}
+										onChange={() => toggleGroupFilter(g.id)}
+									/>
+									{renamingGroupId === g.id ? (
+										<form
+											class="row"
+											style={{ "--gap": "var(--space-2xs)", "--align": "center" }}
+											onSubmit={(e) => {
+												e.preventDefault();
+												runRowAction(async () => {
+													await renameGroupAction(ownerPubkey, privKey, dbKey, g.id, renameValue, publish);
+													setRenamingGroupId(null);
+												});
+											}}
+										>
+											<label class="visually-hidden" for={`rename-group-${g.id}`}>
+												{t("contacts.renameGroupLabel")}
+											</label>
+											<input
+												id={`rename-group-${g.id}`}
+												type="text"
+												value={renameValue}
+												onInput={(e) => setRenameValue(e.currentTarget.value)}
+											/>
+											<button type="submit" disabled={busy}>
+												{t("common.save")}
+											</button>
+											<button type="button" class="btn--ghost" onClick={() => setRenamingGroupId(null)}>
+												{t("common.cancel")}
+											</button>
+										</form>
+									) : (
+										<>
+											<label for={`group-filter-${g.id}`}>
+												{t("channels.create.groupWithCount", { name: g.name, count: g.memberPubkeys.length })}
+											</label>
+											<ActionsMenu label={t("contacts.groupActionsAria", { name: g.name })}>
+												<button
+													type="button"
+													onClick={() => {
+														setRenamingGroupId(g.id);
+														setRenameValue(g.name);
+													}}
+												>
+													<IconPencil /> {t("contacts.renameAction")}
+												</button>
+												<button
+													type="button"
+													class="danger"
+													disabled={busy}
+													onClick={() =>
+														runRowAction(() => deleteGroupAction(ownerPubkey, privKey, dbKey, g.id, publish))
+													}
+												>
+													<IconTrash /> {t("common.delete")}
+												</button>
+											</ActionsMenu>
+										</>
+									)}
+								</div>
+							</li>
+						))}
+						<li>
+							<button
+								type="button"
+								class="chip-add"
+								aria-expanded={showGroupForm}
+								aria-label={t("contacts.newGroupNameLabel")}
+								onClick={() => setShowGroupForm((v) => !v)}
+							>
+								<IconPlus aria-hidden="true" />
+							</button>
+						</li>
+					</ul>
+
+					{showGroupForm && (
+						<form class="contact-group-form row" style={{ "--gap": "var(--space-s)", "--align": "center" }} onSubmit={handleCreateGroup}>
+							<label class="visually-hidden" for="new-group-name">
+								{t("contacts.newGroupNameLabel")}
+							</label>
+							<input
+								id="new-group-name"
+								type="text"
+								class="grow"
+								placeholder={t("contacts.newGroupPlaceholder")}
+								value={newGroupName}
+								onInput={(e) => setNewGroupName(e.currentTarget.value)}
+							/>
+							<button type="submit" disabled={busy}>
+								<IconPlus /> {t("common.add")}
+							</button>
+						</form>
+					)}
+					{groupError && (
+						<p role="alert" style={{ color: "var(--bad)" }}>
+							{groupError}
+						</p>
+					)}
+				</section>
+				)}
+
+				<div class="contacts-main stack">
+					{/* Пользователь: "существующие контакты — главный рабочий блок,
+					    надо поднять вверх и выделить" — был зажат между "Отклонённые"
+					    и "Заблокированные" внизу страницы. Теперь первым, в своей
+					    рамке (contacts-primary-section). */}
+					{!requestsOnly && (
+					<section class="stack contacts-primary-section" aria-labelledby="contacts-heading" style={{ "--gap": "var(--space-s)" }}>
+						<h2 id="contacts-heading" class="visually-hidden">{t("contacts.heading", { count: visibleContacts.length })}</h2>
+						{rowError && (
+							<p role="alert" style={{ color: "var(--bad)" }}>
+								{rowError}
+							</p>
+						)}
+						<ul role="list" class="ucard-list ucard-list--divided stack">
+							{visibleContacts.map((pubkey) => {
+								const memberOfGroups = groupsForContact(pubkey);
+								const isExpanded = expandedPubkey === pubkey;
+								const profile = profiles.value[pubkey];
+								const displayName = profile?.name || shortPubkey(pubkey);
+								return (
+									<Fragment key={pubkey}>
+										<UserCard
+											as="li"
+											variant="row"
+											class="ucard--contact"
+											metaInside
+											avatarUrl={profile?.picture}
+											name={displayName}
+											nameIsNpub={!profile?.name}
+											bio={profile?.about}
+											bioLines={2}
+											onOpen={() => setCardPubkey(pubkey)}
+											openLabel={t("contacts.card.openAria", { name: displayName })}
+											actions={
+												<>
+													<button type="button" class="contact-chat" onClick={() => openChat(pubkey, { backTo: { kind: "people" } })} aria-label={t("contacts.openChatAria", { name: displayName })}>
+														<IconChatBubble />
+													</button>
+													<ActionsMenu label={t("channel.comment.moreActionsAria", { name: displayName })}>
+														<button type="button" onClick={() => placeCall(pubkey)}>
+															<IconPhoneCall /> {t("common.call")}
+														</button>
+														<button type="button" onClick={() => setExpandedPubkey(isExpanded ? null : pubkey)}>
+															<IconGear /> {isExpanded ? t("contacts.hidePermissions") : t("contacts.showPermissions")}
+														</button>
+														<button
+															type="button"
+															class="warn"
+															disabled={busy}
+															onClick={() => runRowAction(() => blockContactAction(pubkey))}
+														>
+															<IconLockClosed /> {t("contacts.blockAction")}
+														</button>
+														<button
+															type="button"
+															class="danger"
+															disabled={busy}
+															onClick={() => setRemoveTarget({ pubkey, name: displayName })}
+														>
+															<IconTrash /> {t("common.delete")}
+														</button>
+													</ActionsMenu>
+												</>
+											}
+											meta={
+												<div class="contact-group-line row" style={{ "--gap": "var(--space-2xs)", "--align": "center" }}>
+													{memberOfGroups.length > 0 && (
+														<>
+															<IconPeople aria-hidden="true" />
+															<span class="contact-group-line__label">{t("contacts.groupsPrefix")}</span>
+														</>
+													)}
+													{memberOfGroups.map((g) => (
+														<span key={g.id} class="group-chip row" style={{ "--gap": "var(--space-3xs)", "--align": "center" }}>
+															{g.name}
+															<button
+																type="button"
+																disabled={busy}
+																aria-label={t("contacts.removeFromGroupAria", { name: g.name })}
+																onClick={() =>
+																	runRowAction(() =>
+																		removeGroupMemberAction(ownerPubkey, privKey, dbKey, g.id, pubkey, publish),
+																	)
+																}
+															>
+																×
+															</button>
+														</span>
+													))}
+													<AddToGroupControl
+														groups={groups.value}
+														excludeGroupIds={memberOfGroups.map((g) => g.id)}
+														disabled={busy}
+														onAdd={(groupId) =>
+															runRowAction(() =>
+																addGroupMemberAction(ownerPubkey, privKey, dbKey, groupId, pubkey, publish),
+															)
+														}
+														onCreate={(name) =>
+															runRowAction(async () => {
+																const groupId = await createGroupAction(ownerPubkey, privKey, dbKey, name, publish);
+																await addGroupMemberAction(ownerPubkey, privKey, dbKey, groupId, pubkey, publish);
+															})
+														}
+													/>
+												</div>
+											}
+										/>
+										{/* PermissionEditor — отдельным <li> следом, не частью карточки:
+										    редактор прав шире карточки (USER-CARD.md, раздел 3). */}
+										{isExpanded && (
+											<li>
+												<PermissionEditor ownerPubkey={ownerPubkey} privKey={privKey} subject={pubkey} />
+											</li>
+										)}
+									</Fragment>
+								);
+							})}
+						</ul>
+						{visibleContacts.length === 0 && (
+							<p style={{ color: "var(--muted)" }}>
+								{contacts.value.length === 0 ? t("contacts.noContactsAtAll") : t("contacts.noContactsInGroups")}
+							</p>
+						)}
+					</section>
+					)}
+
+					{requestsOnly && (
+					<section ref={requestsRef} class="contacts-requests stack" aria-labelledby="requests-heading" style={{ "--gap": "var(--space-s)" }}>
+						<h2 id="requests-heading">{t("contacts.incomingHeading", { count: incomingRequests.value.length })}</h2>
+						{incomingRequests.value.length === 0 ? (
+							<p class="empty-note">{t("contacts.noIncoming")}</p>
+						) : (
+							<ul role="list" class="ucard-list ucard-list--divided stack">
+								{incomingRequests.value.map((req) => {
+									const profile = profiles.value[req.peerPubkey];
+									const displayName = profile?.name || shortPubkey(req.peerPubkey);
+									return (
+										<UserCard
+											as="li"
+											key={req.peerPubkey}
+											variant="row"
+											avatarUrl={profile?.picture}
+											name={displayName}
+											nameIsNpub={!profile?.name}
+											bio={profile?.about}
+											bioLines={2}
+											actions={
+												<>
+													<button type="button" class="btn--ghost btn--good" disabled={busy} onClick={() => handleAcceptContactRequest(req.peerPubkey)}>
+														{t("contacts.acceptButton")}
+													</button>
+													<button type="button" disabled={busy} onClick={() => handleRejectContactRequest(req.peerPubkey)}>
+														{t("contacts.rejectButton")}
+													</button>
+												</>
+											}
+										/>
+									);
+								})}
+							</ul>
+						)}
+					</section>
+					)}
+
+					{/* Входящие, отправленные и отклонённые заявки живут на экране «Заявки»;
+					    «Контакты» показывают только людей и заблокированных. */}
+					{requestsOnly && (
+					<>
+					{/* Пользователь: не диктовал явно, но "Входящие" остаётся всегда
+					    развёрнутым (требует решения) — эти два списка вторичны
+					    (редко нужны, обычно пусты), сворачиваем в <details>
+					    (VISUAL.md v2 .req), чтобы не отвлекали от главного. */}
+					<div class="requests stack" style={{ "--gap": "var(--space-2xs)" }}>
+						<details class="req">
+							<summary class="row" style={{ "--gap": "var(--space-2xs)", "--align": "center" }}>
+								{t("contacts.outgoingSummary")} <span class="req__count">{outgoingRequests.value.length}</span>
+								<IconChevronRight class="icon req__chev" aria-hidden="true" />
+							</summary>
+							<div class="req__body">
+								{outgoingRequests.value.length === 0 ? (
+									<p style={{ color: "var(--muted)" }}>{t("contacts.noOutgoing")}</p>
+								) : (
+									<ul role="list" class="ucard-list ucard-list--divided stack">
+										{outgoingRequests.value.map((req) => {
+											const profile = profiles.value[req.peerPubkey];
+											const displayName = profile?.name || shortPubkey(req.peerPubkey);
+											return (
+												<UserCard
+													as="li"
+													key={req.peerPubkey}
+													variant="row"
+													avatarUrl={profile?.picture}
+													name={displayName}
+													nameIsNpub={!profile?.name}
+													bio={profile?.about}
+													bioLines={2}
+													actions={
+														<button type="button" disabled={busy} onClick={() => runRowAction(() => cancelContactRequestAction(req.peerPubkey))}>
+															{t("contacts.cancelRequestButton")}
+														</button>
+													}
+												/>
+											);
+										})}
+									</ul>
+								)}
+							</div>
+						</details>
+
+						<details class="req">
+							<summary class="row" style={{ "--gap": "var(--space-2xs)", "--align": "center" }}>
+								{t("contacts.rejectedSummary")} <span class="req__count">{rejectedByMe.value.length}</span>
+								<IconChevronRight class="icon req__chev" aria-hidden="true" />
+							</summary>
+							<div class="req__body">
+								{rejectedByMe.value.length === 0 ? (
+									<p style={{ color: "var(--muted)" }}>{t("contacts.noRejected")}</p>
+								) : (
+									<ul role="list" class="ucard-list ucard-list--divided stack">
+										{rejectedByMe.value.map((req) => {
+											const profile = profiles.value[req.peerPubkey];
+											const displayName = profile?.name || shortPubkey(req.peerPubkey);
+											return (
+												<UserCard
+													as="li"
+													key={req.peerPubkey}
+													variant="row"
+													avatarUrl={profile?.picture}
+													name={displayName}
+													nameIsNpub={!profile?.name}
+													bio={profile?.about}
+													bioLines={2}
+													// Отказ — не блокировка (CONTACTS-FSM.md, I6): можно передумать и
+													// написать самому тому, чью заявку отклонил(а) раньше.
+													actions={
+														<button
+															type="button"
+															disabled={busy}
+															onClick={() => runRowAction(() => sendContactRequestAction(req.peerPubkey, ""))}
+														>
+															{t("contacts.addAnywayButton")}
+														</button>
+													}
+												/>
+											);
+										})}
+									</ul>
+								)}
+							</div>
+						</details>
+					</div>
+					</>
+					)}
+
+					{!requestsOnly && (
+					<div class="requests stack" style={{ "--gap": "var(--space-2xs)" }}>
+						<details class="req">
+							<summary class="row" style={{ "--gap": "var(--space-2xs)", "--align": "center" }}>
+								{t("contacts.blockedSummary")} <span class="req__count">{blockedContacts.value.length}</span>
+								<IconChevronRight class="icon req__chev" aria-hidden="true" />
+							</summary>
+							<div class="req__body">
+								<ul role="list" class="ucard-list ucard-list--divided stack">
+									{blockedContacts.value.map((pubkey) => {
+										const profile = profiles.value[pubkey];
+										const displayName = profile?.name || shortPubkey(pubkey);
+										return (
+											<UserCard
+												as="li"
+												key={pubkey}
+												variant="row"
+												avatarUrl={profile?.picture}
+												name={displayName}
+												nameIsNpub={!profile?.name}
+												bio={profile?.about}
+												bioLines={2}
+												actions={
+													<button type="button" disabled={busy} onClick={() => runRowAction(() => unblockContactAction(pubkey))}>
+														{t("contacts.unblockButton")}
+													</button>
+												}
+											/>
+										);
+									})}
+								</ul>
+								{blockedContacts.value.length === 0 && (
+									<p style={{ color: "var(--muted)" }}>{t("contacts.noBlocked")}</p>
+								)}
+							</div>
+						</details>
+					</div>
+					)}
+				</div>
+			</div>
+			{cardPubkey && contacts.value.includes(cardPubkey) && (
+				<ContactModal
+					pubkey={cardPubkey}
+					profile={profiles.value[cardPubkey]}
+					displayName={profiles.value[cardPubkey]?.name || shortPubkey(cardPubkey)}
+					busy={busy}
+					onClose={() => setCardPubkey(null)}
+					onOpenChat={() => {
+						setCardPubkey(null);
+						openChat(cardPubkey, { backTo: { kind: "people" } });
+					}}
+					onCall={() => {
+						setCardPubkey(null);
+						placeCall(cardPubkey);
+					}}
+					onBlock={() => {
+						const pk = cardPubkey;
+						setCardPubkey(null);
+						runRowAction(() => blockContactAction(pk));
+					}}
+					onRemove={() => {
+						const pk = cardPubkey;
+						setCardPubkey(null);
+						setRemoveTarget({ pubkey: pk, name: profiles.value[pk]?.name || shortPubkey(pk) });
+					}}
+				/>
+			)}
+			{removeTarget && (
+				<RemoveContactDialog
+					name={removeTarget.name}
+					busy={busy}
+					onCancel={() => setRemoveTarget(null)}
+					onConfirm={(withChat) => {
+						const { pubkey } = removeTarget;
+						setRemoveTarget(null);
+						runRowAction(async () => {
+							await removeContactAction(pubkey);
+							if (withChat) await deleteChatForeverAction(ownerPubkey, privKey, dbKey, pubkey, publish, refreshGroupMessageSubscription);
+						});
+					}}
+				/>
+			)}
+		</Screen>
+	);
+}
+
+// Ссылка «Добавить в группу» есть ВСЕГДА (живая проверка: когда групп ещё нет,
+// кнопки не было вовсе, и человек не понимал, как группу создать). Внутри меню
+// — чекбоксы существующих групп (можно отметить несколько, меню не закрывается
+// по клику на чекбокс) и внизу поле «Новая группа» + «ОК»: создаёт группу и
+// сразу кладёт в неё этот контакт.
+function AddToGroupControl({ groups, excludeGroupIds, onAdd, onCreate, disabled }) {
+	const { ref, handleMenuClick } = useDetailsMenu();
+	const [name, setName] = useState("");
+	const available = groups.filter((g) => !excludeGroupIds.includes(g.id));
+
+	function submit(e) {
+		e.preventDefault();
+		const trimmed = name.trim();
+		if (!trimmed) return;
+		setName("");
+		if (ref.current) ref.current.open = false;
+		onCreate(trimmed);
+	}
+
+	return (
+		<details class="menu" ref={ref} onClick={handleMenuClick}>
+			<summary class="add-to-group-link row" style={{ "--gap": "var(--space-3xs)", "--align": "center", cursor: "pointer" }}>
+				<IconPlus aria-hidden="true" /> {t("contacts.addToGroupLabel")}
+			</summary>
+			<div class="menu-pop stack" style={{ "--gap": "2px" }}>
+				{available.map((g) => (
+					<label key={g.id} class="menu-check">
+						<input type="checkbox" disabled={disabled} onChange={() => onAdd(g.id)} />
+						{g.name}
+					</label>
+				))}
+				<form class="add-to-group-new row" style={{ "--gap": "var(--space-2xs)", "--align": "center" }} onSubmit={submit}>
+					<input
+						type="text"
+						aria-label={t("contacts.newGroupNameLabel")}
+						placeholder={t("contacts.newGroupPlaceholder")}
+						value={name}
+						disabled={disabled}
+						onInput={(e) => setName(e.currentTarget.value)}
+					/>
+					<button type="submit" disabled={disabled || !name.trim()}>
+						{t("contacts.newGroupOk")}
+					</button>
+				</form>
+			</div>
+		</details>
+	);
+}

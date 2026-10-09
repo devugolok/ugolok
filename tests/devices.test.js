@@ -1,0 +1,462 @@
+import "fake-indexeddb/auto";
+import { test, before, beforeEach, after } from "node:test";
+import assert from "node:assert/strict";
+import { db } from "../src/core/store/database.js";
+import { getPublicKey } from "../src/core/crypto/keys.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+import { unwrap as nip59Unwrap } from "../src/core/crypto/nip59.js";
+import {
+	createOwnKeyPackage,
+	joinFromWelcome,
+	serializeState,
+	deserializeState,
+	encryptApplicationMessage,
+	deriveNostrEnvelopeKeys,
+} from "../src/core/crypto/mls-session.js";
+import { encrypt as nip44Encrypt } from "../src/core/crypto/nip44.js";
+import { ensureChatEstablished, receiveGroupMessageEvent, computeGroupId } from "../src/domain/messaging/chat.js";
+import { syncDeviceMembership, handleDeviceAnnounce } from "../src/domain/messaging/devices.js";
+import { getOrCreateDeviceId } from "../src/domain/identity/device.js";
+import { toEncryptedRow, fromEncryptedRow } from "../src/core/store/encrypted-table.js";
+import { MLS_GROUPS_PLAINTEXT_FIELDS } from "../src/core/store/table-fields.js";
+
+const ALICE_PRIV = new Uint8Array(32).fill(1);
+const BOB_PRIV = new Uint8Array(32).fill(2);
+const ALICE_PUB = bytesToHex(getPublicKey(ALICE_PRIV));
+const BOB_PUB = bytesToHex(getPublicKey(BOB_PRIV));
+const DB_KEY = crypto.getRandomValues(new Uint8Array(32));
+
+function encodeBase64(bytes) {
+	return btoa(String.fromCharCode.apply(null, bytes));
+}
+
+before(async () => {
+	await db.open();
+});
+
+beforeEach(async () => {
+	await db.table("ownKeyPackage").clear();
+	await db.table("mlsGroups").clear();
+	await db.table("deviceIdentity").clear();
+	await db.table("knownDevices").clear();
+	await db.table("knownContactDevices").clear();
+	await db.table("processedGroupEvents").clear();
+});
+
+after(() => {
+	db.close();
+});
+
+// Устанавливает реальный MLS-чат Alice<->Bob (как chat.test.js's establishAliceToBob),
+// оставляя запись Алисы последней в db.mlsGroups (её "устройство А" будет sync'ить сиблингов).
+// Возвращает bobKeyPackage/bobSerializedState — нужны, чтобы отдельно проверить, что Боб
+// (уже существующий участник) реально получает и применяет коммит при добавлении сиблинга.
+async function establishAliceToBob() {
+	const bobKeyPackage = await createOwnKeyPackage(BOB_PUB, "alice-main-device");
+	const fetchDeviceKeyPackages = async () => new Map([["alice-main-device", { wireBytes: bobKeyPackage.wireBytes, createdAt: 1000 }]]);
+	let welcomeGiftWrap;
+	const publish = async (event) => {
+		if (event.kind === 1059) welcomeGiftWrap = event;
+		return { ok: true };
+	};
+	await ensureChatEstablished(ALICE_PUB, ALICE_PRIV, DB_KEY, BOB_PUB, publish, fetchDeviceKeyPackages);
+
+	const rumor = nip59Unwrap(welcomeGiftWrap, BOB_PRIV);
+	const welcomeWireBytes = Uint8Array.from(atob(rumor.content), (c) => c.charCodeAt(0));
+	const bobState = await joinFromWelcome(bobKeyPackage, welcomeWireBytes);
+	return { bobKeyPackage, bobSerializedState: serializeState(bobState) };
+}
+
+// Симулирует "теперь мы на устройстве Боба" — подкладывает его копию состояния в
+// db.mlsGroups (единственная база в этом тестовом процессе), не трогая копию Алисы
+// (тот же паттерн, что chat.test.js's asBob). Этап 39 — строка теперь зашифрована DB_KEY.
+// Этап 74 — T2.3: processedGroupEvents (дедуп-журнал) в реальности живёт В ТОЙ ЖЕ
+// локальной БД, что mlsGroups — per-device, не per-identity. Этот тестовый процесс
+// делит одну db на "несколько устройств Боба" ТОЛЬКО через подмену состояния под
+// одним ключом — без сброса журнала здесь второй симулированный физический прибор
+// (например, bob-device-2 в handleDeviceAnnounce-тесте) ложно считался бы уже
+// обработавшим событие, которое на самом деле впервые видит именно ОН.
+async function asBob(groupIdHex, bobSerializedState, fn) {
+	await db.table("mlsGroups").put(
+		toEncryptedRow({ ownerPubkey: BOB_PUB, groupId: groupIdHex, contactPubkey: ALICE_PUB, state: bobSerializedState }, MLS_GROUPS_PLAINTEXT_FIELDS, DB_KEY),
+	);
+	await db.table("processedGroupEvents").where("ownerPubkey").equals(BOB_PUB).delete();
+	const result = await fn();
+	const updatedBobRaw = await db.table("mlsGroups").get([BOB_PUB, groupIdHex]);
+	const updatedBobRow = fromEncryptedRow(updatedBobRaw, DB_KEY);
+	return { result, updatedBobSerializedState: updatedBobRow.state };
+}
+
+test("syncDeviceMembership: существующий участник (Bob) получает КОММИТ и реально продвигает эпоху — не застревает молча", async () => {
+	const { bobSerializedState: bobStateBeforeAdd } = await establishAliceToBob();
+	const groupIdHex = bytesToHex(computeGroupId(ALICE_PUB, BOB_PUB));
+
+	const siblingKeyPackage = await createOwnKeyPackage(ALICE_PUB, "sibling-device");
+	const published = [];
+	const publish = async (event) => {
+		published.push(event);
+		return { ok: true };
+	};
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, async () => [
+		{ wireBytes: siblingKeyPackage.wireBytes, deviceId: "sibling-1" },
+	]);
+
+	const commitEvents = published.filter((e) => e.kind === 445);
+	assert.equal(commitEvents.length, 1, "должен опубликовать РОВНО один коммит для существующего участника (Bob)");
+	assert.deepEqual(commitEvents[0].tags, [["h", groupIdHex]]);
+
+	// Боб получает коммит через уже существующий receiveGroupMessageEvent (chat.js, этап 24) —
+	// без правки chat.js: коммит — это просто ещё один kind 445, ветка result.kind==="control".
+	const { result: commitResult, updatedBobSerializedState } = await asBob(groupIdHex, bobStateBeforeAdd, () =>
+		receiveGroupMessageEvent(BOB_PUB, BOB_PRIV, DB_KEY, commitEvents[0], async () => ({ ok: true })),
+	);
+	assert.equal(commitResult, null, "коммит — control-сообщение, не текст, UI ничего не показывает");
+
+	// Доказательство, что эпоха РЕАЛЬНО продвинулась (не просто "не бросило исключение"):
+	// сиблинг (уже член группы после Welcome) шлёт НОВОЕ сообщение в НОВОЙ эпохе,
+	// и обновлённое состояние Боба обязано суметь его расшифровать.
+	const welcomeEvent = published.find((e) => e.kind === 1059);
+	const welcomeRumor = nip59Unwrap(welcomeEvent, ALICE_PRIV);
+	const welcomeWireBytes = Uint8Array.from(atob(welcomeRumor.content), (c) => c.charCodeAt(0));
+	let siblingState = await joinFromWelcome(siblingKeyPackage, welcomeWireBytes);
+
+	function encodeBase64(bytes) {
+		return btoa(String.fromCharCode.apply(null, bytes));
+	}
+	const plaintext = new TextEncoder().encode(JSON.stringify({ text: "после добавления сиблинга", lamportTs: 99, msgId: "x" }));
+	const encResult = await encryptApplicationMessage(siblingState, plaintext);
+	siblingState = encResult.newSessionState;
+	const { privateKey, publicKey } = await deriveNostrEnvelopeKeys(siblingState);
+	const content = nip44Encrypt(encodeBase64(encResult.wireBytes), privateKey, bytesToHex(publicKey));
+	const siblingMessageEvent = { kind: 445, tags: [["h", groupIdHex]], content, id: "sibling-msg", pubkey: "irrelevant" };
+
+	const { result: decryptedByBob } = await asBob(groupIdHex, updatedBobSerializedState, () =>
+		receiveGroupMessageEvent(BOB_PUB, BOB_PRIV, DB_KEY, siblingMessageEvent, async () => ({ ok: true })),
+	);
+	// contactPubkey (этап 34) — аддитивное поле, нужное transport.js для уведомлений.
+	assert.deepEqual(decryptedByBob, { text: "после добавления сиблинга", lamportTs: 99, contactPubkey: ALICE_PUB });
+});
+
+test("syncDeviceMembership: нет анонсов — no-op, publish не вызывается", async () => {
+	const publish = async () => {
+		throw new Error("не должен вызываться");
+	};
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, async () => []);
+});
+
+test("syncDeviceMembership: собственный deviceId в анонсах игнорируется", async () => {
+	const myDeviceId = await getOrCreateDeviceId();
+	const publish = async () => {
+		throw new Error("не должен вызываться для собственного анонса");
+	};
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, async () => [
+		{ wireBytes: new Uint8Array(1), deviceId: myDeviceId },
+	]);
+	const known = await db.table("knownDevices").toArray();
+	assert.equal(known.length, 0);
+});
+
+test("syncDeviceMembership: анонс без device-тега (легаси) игнорируется", async () => {
+	const publish = async () => {
+		throw new Error("не должен вызываться");
+	};
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, async () => [
+		{ wireBytes: new Uint8Array(1), deviceId: undefined },
+	]);
+	const known = await db.table("knownDevices").toArray();
+	assert.equal(known.length, 0);
+});
+
+test("syncDeviceMembership: новый сиблинг без активных чатов — записан в knownDevices, ничего не публикуется", async () => {
+	const siblingKeyPackage = await createOwnKeyPackage(ALICE_PUB, "sibling-device");
+	const publish = async () => {
+		throw new Error("не должен вызываться — нет активных групп");
+	};
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, async () => [
+		{ wireBytes: siblingKeyPackage.wireBytes, deviceId: "sibling-1" },
+	]);
+	const row = await db.table("knownDevices").get([ALICE_PUB, "sibling-1"]);
+	assert.ok(row);
+	assert.deepEqual(row.addedGroupIds, []);
+});
+
+test("syncDeviceMembership: новый сиблинг + один активный чат — добавлен в MLS-группу, Welcome опубликован", async () => {
+	await establishAliceToBob();
+	const rowsBefore = await db.table("mlsGroups").where("ownerPubkey").equals(ALICE_PUB).toArray();
+	assert.equal(rowsBefore.length, 1);
+	const groupIdHex = rowsBefore[0].groupId; // groupId остаётся plaintext (MLS_GROUPS_PLAINTEXT_FIELDS)
+
+	const siblingKeyPackage = await createOwnKeyPackage(ALICE_PUB, "sibling-device");
+	const published = [];
+	const publish = async (event) => {
+		published.push(event);
+		return { ok: true };
+	};
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, async () => [
+		{ wireBytes: siblingKeyPackage.wireBytes, deviceId: "sibling-1" },
+	]);
+
+	assert.equal(published.length, 2, "коммит (kind 445, для Боба) + Welcome (kind 1059, для сиблинга)");
+	assert.equal(
+		published.filter((e) => e.kind === 445).length,
+		1,
+		"коммит для уже существующего участника (Боба) — обязателен, иначе он застрянет на старой эпохе",
+	);
+	const welcomeGiftWrap = published.find((e) => e.kind === 1059);
+	assert.ok(welcomeGiftWrap, "Welcome доставляется как gift-wrap");
+	const rumor = nip59Unwrap(welcomeGiftWrap, ALICE_PRIV);
+	assert.equal(rumor.kind, 444);
+	assert.equal(rumor.pubkey, ALICE_PUB, "sibling-Welcome отправлен от МОЕГО ЖЕ identity, не от Боба");
+	assert.deepEqual(
+		rumor.tags,
+		[["contact", BOB_PUB]],
+		"contactPubkey обязан быть тегом — rumor.pubkey===я не годится диспетчеру, чтобы понять, с кем этот чат (DESIGN.md, раздел 1b)",
+	);
+	const welcomeWireBytes = Uint8Array.from(atob(rumor.content), (c) => c.charCodeAt(0));
+	const siblingState = await joinFromWelcome(siblingKeyPackage, welcomeWireBytes);
+	assert.ok(siblingState, "сиблинг реально может применить Welcome и присоединиться к группе");
+
+	const knownRow = await db.table("knownDevices").get([ALICE_PUB, "sibling-1"]);
+	assert.deepEqual(knownRow.addedGroupIds, [groupIdHex]);
+
+	const aliceGroupRow = fromEncryptedRow(await db.table("mlsGroups").get([ALICE_PUB, groupIdHex]), DB_KEY);
+	assert.equal(aliceGroupRow.contactPubkey, BOB_PUB, "contactPubkey Алисы не потерян после addMember");
+});
+
+test("syncDeviceMembership: повторный вызов с тем же сиблингом и той же группой — НЕ дублирует addMember/Welcome", async () => {
+	await establishAliceToBob();
+	const siblingKeyPackage = await createOwnKeyPackage(ALICE_PUB, "sibling-device");
+	const fetch = async () => [{ wireBytes: siblingKeyPackage.wireBytes, deviceId: "sibling-1" }];
+	let publishCount = 0;
+	const publish = async () => {
+		publishCount++;
+		return { ok: true };
+	};
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, fetch);
+	assert.equal(publishCount, 2, "коммит + Welcome на первое добавление");
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, fetch);
+	assert.equal(publishCount, 2, "второй заход не должен снова добавлять уже добавленного сиблинга в ту же группу");
+});
+
+test("syncDeviceMembership: сиблинг уже известен (без групп), позже появляется новая группа — добавляется при следующем заходе", async () => {
+	const siblingKeyPackage = await createOwnKeyPackage(ALICE_PUB, "sibling-device");
+	const fetch = async () => [{ wireBytes: siblingKeyPackage.wireBytes, deviceId: "sibling-1" }];
+	const publish = async () => ({ ok: true });
+
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, fetch);
+	let knownRow = await db.table("knownDevices").get([ALICE_PUB, "sibling-1"]);
+	assert.deepEqual(knownRow.addedGroupIds, []);
+
+	await establishAliceToBob();
+	let publishCount = 0;
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, async (e) => {
+		publishCount++;
+		return { ok: true };
+	}, fetch);
+	assert.equal(publishCount, 2, "новая группа должна быть подхвачена на следующем заходе (коммит + Welcome)");
+	knownRow = await db.table("knownDevices").get([ALICE_PUB, "sibling-1"]);
+	assert.equal(knownRow.addedGroupIds.length, 1);
+});
+
+test("syncDeviceMembership: повреждённое объявление одного сиблинга не блокирует обработку ДРУГОГО (изоляция по элементу, найдено адверсарным заходом)", async () => {
+	await establishAliceToBob();
+	const goodSibling = await createOwnKeyPackage(ALICE_PUB, "good-device");
+	const published = [];
+	const publish = async (event) => {
+		published.push(event);
+		return { ok: true };
+	};
+
+	await syncDeviceMembership(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, async () => [
+		{ wireBytes: new Uint8Array([1, 2, 3, 4]), deviceId: "broken-device" }, // мусорные байты — addMember должен упасть
+		{ wireBytes: goodSibling.wireBytes, deviceId: "good-device" },
+	]);
+
+	assert.equal(published.length, 2, "хороший сиблинг всё равно должен быть добавлен (коммит + Welcome)");
+	const knownGood = await db.table("knownDevices").get([ALICE_PUB, "good-device"]);
+	assert.equal(knownGood.addedGroupIds.length, 1, "хороший сиблинг добавлен, несмотря на сбой на сломанном");
+	const knownBroken = await db.table("knownDevices").get([ALICE_PUB, "broken-device"]);
+	assert.ok(knownBroken, "сломанный сиблинг всё равно записан как известный (сбой был в addMember, не раньше)");
+	assert.deepEqual(knownBroken.addedGroupIds, [], "но НЕ отмечен как добавленный в группу — сбой не замаскирован");
+});
+
+// Этап 72 — handleDeviceAnnounce: единая точка входа для ЖИВОЙ (реактивной)
+// досинхронизации, вызывается на КАЖДОЕ kind:443-событие по отдельности (не
+// пакетом, как syncDeviceMembership). Ветка announcerPubkey===ownerPubkey —
+// свой сиблинг (тот же addSiblingToGroup, что уже проверен выше). Ветка
+// announcerPubkey===contactPubkey — НОВАЯ: устройство КОНТАКТА появилось
+// ПОСЛЕ установления чата (симметрично своим сиблингам, но раньше не
+// существовало вовсе — корень бага "работает только между одной парой окон").
+test("handleDeviceAnnounce: НОВОЕ устройство КОНТАКТА (не своё) — существующий участник (Боб-1) получает коммит и продвигает эпоху, новое устройство Боба реально присоединяется", async () => {
+	const { bobSerializedState: bob1StateBeforeAdd } = await establishAliceToBob();
+	const groupIdHex = bytesToHex(computeGroupId(ALICE_PUB, BOB_PUB));
+
+	const bob2KeyPackage = await createOwnKeyPackage(BOB_PUB, "bob-device-2");
+	const published = [];
+	const publish = async (event) => {
+		published.push(event);
+		return { ok: true };
+	};
+	await handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, BOB_PUB, "bob-device-2", bob2KeyPackage.wireBytes);
+
+	const commitEvents = published.filter((e) => e.kind === 445);
+	assert.equal(commitEvents.length, 1, "коммит для уже существующего устройства Боба (bob-device-1)");
+	assert.deepEqual(commitEvents[0].tags, [["h", groupIdHex]]);
+
+	// bob-device-1 (уже участник) получает коммит через обычный приёмный путь и продвигает эпоху.
+	const { result: commitResult, updatedBobSerializedState } = await asBob(groupIdHex, bob1StateBeforeAdd, () =>
+		receiveGroupMessageEvent(BOB_PUB, BOB_PRIV, DB_KEY, commitEvents[0], async () => ({ ok: true })),
+	);
+	assert.equal(commitResult, null, "коммит — control, UI ничего не показывает");
+
+	// bob-device-2 (новое устройство) реально принимает Welcome — адресован КОНТАКТУ (Бобу), не мне.
+	const welcomeGiftWrap = published.find((e) => e.kind === 1059);
+	assert.ok(welcomeGiftWrap);
+	const rumor = nip59Unwrap(welcomeGiftWrap, BOB_PRIV);
+	assert.equal(rumor.kind, 444);
+	assert.equal(rumor.pubkey, ALICE_PUB, "welcome отправлен от МЕНЯ (owner), получатель — Боб, как обычный Welcome");
+	const welcomeWireBytes = Uint8Array.from(atob(rumor.content), (c) => c.charCodeAt(0));
+	const bob2State = await joinFromWelcome(bob2KeyPackage, welcomeWireBytes);
+	assert.ok(bob2State);
+
+	// Бухгалтерия: устройство контакта отмечено известным — реактивный повтор не задвоит.
+	const knownRow = await db.table("knownContactDevices").get([ALICE_PUB, BOB_PUB, "bob-device-2"]);
+	assert.ok(knownRow);
+
+	// Доказательство: ОБА устройства Боба (после коммита/после welcome) расшифровывают
+	// НОВОЕ сообщение Алисы, отправленное ПОСЛЕ добавления bob-device-2.
+	const aliceGroupRow = fromEncryptedRow(await db.table("mlsGroups").get([ALICE_PUB, groupIdHex]), DB_KEY);
+	const aliceState = deserializeState(aliceGroupRow.state);
+	const sendResult = await encryptApplicationMessage(aliceState, new TextEncoder().encode(JSON.stringify({ text: "всем привет", lamportTs: 5, msgId: "y" })));
+	const aliceEnvKeys = await deriveNostrEnvelopeKeys(aliceState);
+	const aliceMessageEvent = {
+		kind: 445,
+		tags: [["h", groupIdHex]],
+		content: nip44Encrypt(encodeBase64(sendResult.wireBytes), aliceEnvKeys.privateKey, bytesToHex(aliceEnvKeys.publicKey)),
+		id: "alice-msg",
+		pubkey: "irrelevant",
+	};
+
+	const { result: byBob1 } = await asBob(groupIdHex, updatedBobSerializedState, () =>
+		receiveGroupMessageEvent(BOB_PUB, BOB_PRIV, DB_KEY, aliceMessageEvent, async () => ({ ok: true })),
+	);
+	assert.deepEqual(byBob1, { text: "всем привет", lamportTs: 5, contactPubkey: ALICE_PUB });
+
+	const { result: byBob2 } = await asBob(groupIdHex, serializeState(bob2State), () =>
+		receiveGroupMessageEvent(BOB_PUB, BOB_PRIV, DB_KEY, aliceMessageEvent, async () => ({ ok: true })),
+	);
+	assert.deepEqual(byBob2, { text: "всем привет", lamportTs: 5, contactPubkey: ALICE_PUB });
+});
+
+test("handleDeviceAnnounce: устройство контакта, но чата с ним ЕЩЁ НЕТ — no-op (нечего досинхронизировать, publish не вызывается)", async () => {
+	const publish = async () => {
+		throw new Error("не должен вызываться — нет установленного чата");
+	};
+	await handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, BOB_PUB, "bob-device", new Uint8Array([1, 2, 3]));
+});
+
+// Этап 73.3 — найдено харнессом (m1-repro.test.js): без этого гейта Боб
+// (НЕ коммиттер пары ALICE_PUB<BOB_PUB) независимо коммитил бы добавление
+// нового устройства Алисы ОДНОВРЕМЕННО с самой Алисой (её sibling-branch) —
+// два commit'а в одну эпоху одной группы, классический М2. Гейт: только
+// коммиттер пары когда-либо коммитит в группу — контактная ветка молчит,
+// даже если чат УЖЕ установлен и устройство контакта РЕАЛЬНО новое.
+test("handleDeviceAnnounce: Боб (НЕ коммиттер пары) — контактная ветка no-op, даже с установленным чатом и новым устройством Алисы", async () => {
+	const { bobSerializedState } = await establishAliceToBob();
+	const groupIdHex = bytesToHex(computeGroupId(ALICE_PUB, BOB_PUB));
+	const alice2KeyPackage = await createOwnKeyPackage(ALICE_PUB, "alice-device-2");
+	const publish = async () => {
+		throw new Error("Боб не коммиттер пары (ALICE_PUB, BOB_PUB) — не должен пытаться коммитить");
+	};
+	const { updatedBobSerializedState } = await asBob(groupIdHex, bobSerializedState, () =>
+		handleDeviceAnnounce(BOB_PUB, BOB_PRIV, DB_KEY, publish, ALICE_PUB, "alice-device-2", alice2KeyPackage.wireBytes),
+	);
+	assert.deepEqual(updatedBobSerializedState, bobSerializedState, "состояние группы Боба не должно измениться");
+	assert.equal(await db.table("knownContactDevices").get([BOB_PUB, ALICE_PUB, "alice-device-2"]), undefined);
+});
+
+test("handleDeviceAnnounce: deviceId отсутствует (легаси/чужеродное) — no-op вне зависимости от announcerPubkey", async () => {
+	await establishAliceToBob();
+	const publish = async () => {
+		throw new Error("не должен вызываться");
+	};
+	await handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, BOB_PUB, undefined, new Uint8Array([1]));
+	await handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, ALICE_PUB, undefined, new Uint8Array([1]));
+});
+
+test("handleDeviceAnnounce: устройство контакта уже известно (knownContactDevices) — повтор не задваивает (publish не вызывается)", async () => {
+	await establishAliceToBob();
+	const bob2KeyPackage = await createOwnKeyPackage(BOB_PUB, "bob-device-2");
+	let publishCount = 0;
+	const publish = async () => {
+		publishCount++;
+		return { ok: true };
+	};
+	await handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, BOB_PUB, "bob-device-2", bob2KeyPackage.wireBytes);
+	assert.equal(publishCount, 2, "первый заход: коммит + welcome");
+
+	await handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, BOB_PUB, "bob-device-2", bob2KeyPackage.wireBytes);
+	assert.equal(publishCount, 2, "повторный анонс того же устройства контакта — no-op");
+});
+
+test("handleDeviceAnnounce: announcerPubkey === ownerPubkey (своё устройство) — работает как syncDeviceMembership (own-sibling путь не сломан объединением точки входа)", async () => {
+	await establishAliceToBob();
+	const siblingKeyPackage = await createOwnKeyPackage(ALICE_PUB, "sibling-device");
+	const published = [];
+	const publish = async (event) => {
+		published.push(event);
+		return { ok: true };
+	};
+	await handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, ALICE_PUB, "sibling-1", siblingKeyPackage.wireBytes);
+
+	assert.equal(published.length, 2, "коммит (для Боба) + Welcome (для сиблинга) — та же семантика, что syncDeviceMembership");
+	const knownRow = await db.table("knownDevices").get([ALICE_PUB, "sibling-1"]);
+	assert.ok(knownRow);
+	assert.equal(knownRow.addedGroupIds.length, 1);
+});
+
+test("handleDeviceAnnounce: announcerPubkey === ownerPubkey, deviceId === myDeviceId (собственный анонс) — no-op", async () => {
+	const myDeviceId = await getOrCreateDeviceId();
+	const publish = async () => {
+		throw new Error("не должен вызываться для собственного анонса");
+	};
+	await handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, ALICE_PUB, myDeviceId, new Uint8Array([1]));
+});
+
+// АДВЕРСАРНО (этап 72) — гонка: ДВА вызова handleDeviceAnnounce для ОДНОГО И
+// ТОГО ЖЕ нового устройства контакта, второй начинается ДО того, как первый
+// успел записать knownContactDevices (redelivery того же kind:443 с двух
+// relay, или просто повторный live-batch до завершения предыдущего await).
+// НАЙДЕНО ЭТИМ ЖЕ ТЕСТОМ (не домысел): без guard'а ts-mls НЕ ловит второй
+// вызов как "уже участник" — оба читают ОДНО И ТО ЖЕ пред-коммитное состояние
+// НЕЗАВИСИМО (ни один ещё не записал своё), оба честно проходят addMember,
+// оба публикуют welcome — потерянное обновление, не ошибка протокола.
+// handleDeviceAnnounceInFlight (devices.js) коалесцирует одновременные вызовы
+// с одинаковым ключом в ОДНО реальное выполнение — проверяем именно это.
+test("handleDeviceAnnounce АДВЕРСАРНО: гонка — два параллельных вызова для ОДНОГО нового устройства контакта коалесцируются в одно выполнение, не задваивают welcome", async () => {
+	await establishAliceToBob();
+	const bob2KeyPackage = await createOwnKeyPackage(BOB_PUB, "bob-device-2");
+	const published = [];
+	const publish = async (event) => {
+		published.push(event);
+		return { ok: true };
+	};
+
+	// Promise.all — оба вызова стартуют ДО того, как любой успевает дописать
+	// knownContactDevices (тот await ещё не наступил в момент старта второго).
+	await Promise.all([
+		handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, BOB_PUB, "bob-device-2", bob2KeyPackage.wireBytes),
+		handleDeviceAnnounce(ALICE_PUB, ALICE_PRIV, DB_KEY, publish, BOB_PUB, "bob-device-2", bob2KeyPackage.wireBytes),
+	]);
+
+	// Ровно ОДНА пара (коммит+welcome) реально прошла — вторая попытка не задвоила эффект.
+	assert.equal(published.filter((e) => e.kind === 1059).length, 1, "welcome опубликован ровно один раз, не дважды");
+
+	// Устройство контакта реально добавлено (первый вызов победил) — bob-device-2
+	// может присоединиться по опубликованному welcome.
+	const welcomeGiftWrap = published.find((e) => e.kind === 1059);
+	const rumor = nip59Unwrap(welcomeGiftWrap, BOB_PRIV);
+	const welcomeWireBytes = Uint8Array.from(atob(rumor.content), (c) => c.charCodeAt(0));
+	const bob2State = await joinFromWelcome(bob2KeyPackage, welcomeWireBytes);
+	assert.ok(bob2State, "устройство контакта реально в группе, несмотря на гонку");
+});

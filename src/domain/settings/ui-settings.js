@@ -1,0 +1,371 @@
+import { sign } from "../../core/crypto/sign.js";
+import { getPublicKey } from "../../core/crypto/keys.js";
+import { encrypt as nip44Encrypt, decrypt as nip44Decrypt } from "../../core/crypto/nip44.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
+import { db } from "../../core/store/database.js";
+import { pickLatest } from "../../core/sync/lww.js";
+import { publishDurably } from "../../core/store/outbox.js";
+import { registerTrustedImageOrigins } from "../media/url-guard.js";
+import { registerUserServers } from "../files/servers.js";
+import { BUILD_DEFAULT_RELAYS, getBuildBlossomServers } from "../../config.js";
+import { readBootstrapEndpoints, isLoopbackHost } from "./bootstrap-endpoints.js";
+import { buildRelayListEvent } from "../identity/relay-list.js";
+import { buildDmRelayListEvent } from "../identity/dm-relay-list.js";
+import { toEncryptedRow, fromEncryptedRow } from "../../core/store/encrypted-table.js";
+import { UI_SETTINGS_PLAINTEXT_FIELDS } from "../../core/store/table-fields.js";
+import { detectSystemLocale } from "./locale-detection.js";
+import { DomainError } from "../errors.js";
+import { DEFAULT_CUSTOM_PALETTE } from "../../ui/theme/palette-apply.js";
+import { nudgeHueOutOfForbiddenZones } from "../../ui/theme/palette-generator.js";
+
+// F-SY-03 (TECH.md) — d-tag='settings' буквально, не opaque (не privacy-чувствительно,
+// тот же принцип, что read-status/drafts этапа 26).
+export const KIND_UI_SETTINGS = 30072;
+
+// Этап 47 — уровни уведомления вместо булевых тумблеров (DESIGN.md: упорядоченное
+// множество off/badge/popup/sound, не 3 независимых флага). Старое поле верхнего
+// уровня `sound` больше не нужно — звук теперь часть шкалы уровня самой категории/
+// подкатегории/entity-override, не отдельный глобальный рубильник.
+export const DEFAULT_NOTIFICATIONS = {
+	enabled: true,
+	contacts: { newRequests: "sound", accepted: "popup" },
+	messages: { default: "sound", overrides: {} }, // overrides: {[contactPubkey]: level}
+	channels: {
+		posts: "popup",
+		comments: "popup",
+		chat: "sound",
+		overrides: {}, // overrides: {[channelId]: {posts?, comments?, chat?}}
+	},
+	replies: "sound", // ответ на МОЙ пост/комментарий — глобально, без per-entity
+	moderation: { reports: "popup" }, // бан/warn/delete — принудительно вне settings, см. notifier.js
+	inbox: "popup", // этап 47-довесок-3 — заявка (MLS Welcome) от НЕЗНАКОМЦА, глобально
+};
+
+export const DEFAULT_SETTINGS = {
+	// Этап 70 — accentColorId (14 именованных пресетов) убран как активное поле:
+	// заменён customPalette (генератор палитры). НЕ добавлен сюда как "customPalette:
+	// DEFAULT_CUSTOM_PALETTE" — null означает "пользователь ничего не выбирал",
+	// build-дефолт применяется на уровне applyCustomPalette (см. CONTRACTS.md,
+	// этап 70), не здесь, иначе новый аккаунт и "явно выбрал дефолтный пресет"
+	// стали бы неотличимы.
+	customPalette: null,
+	uiScale: "medium",
+	themeMode: "light", // "light"|"dark" = явный выбор; null = "как в системе" (prefers-color-scheme) — дефолт для НОВЫХ аккаунтов светлый (решение владельца), не системный
+	language: "ru",
+	notifications: DEFAULT_NOTIFICATIONS,
+	relayUrls: [],
+	blossomUrls: [],
+	activeBlossomUrl: null,
+	selfHostedServer: null, // null | {host, port, token, fingerprint, pairedAt} — Этап 63, И3
+	// Редизайн интерфейса, этап 4 (CONTRACTS.md) — "срок хоть раз ставили".
+	// Управляет появлением кнопки "Сегодня": один раз true -> навсегда true,
+	// даже когда открытых дел с сроком снова стало 0 (REDESIGN-SPEC.md:
+	// "мигающий туда-сюда элемент хуже лишней кнопки").
+	everSetDueDate: false,
+	// READ-STATUS-AND-LAST-SEEN-TZ A4 — «Сообщать о прочтении», по умолчанию вкл.
+	// Выключена — read-курсор не уходит; delivered продолжает.
+	sendReadReceipts: true,
+};
+
+// Этап 70 — МИНИМАЛЬНАЯ таблица только для одноразовой миграции старого
+// accentColorId (14 пресетов accent-palette.js, файл удалён вместе со
+// свотч-кнопками в settings.jsx) в customPalette нового генератора палитры.
+// Никаких label/UI-полей — та часть ушла безвозвратно, тут только hue,
+// нужный чтобы не потерять уже сделанный пользователем выбор цвета.
+const LEGACY_ACCENT_HUES = {
+	blue: 255,
+	indigo: 275,
+	sky: 230,
+	teal: 185,
+	cyan: 200,
+	lavender: 290,
+	violet: 305,
+	terracotta: 35,
+	amber: 75,
+	peach: 45,
+	saffron: 85,
+	orange: 55,
+	olive: 115,
+	moss: 140,
+};
+
+// Одноразовая миграция: уже установленный customPalette (явный выбор
+// пользователя, в том числе после первой миграции) — приоритетнее и не
+// перезаписывается. Неизвестный/битый accentColorId — не мигрирует, не падает
+// (customPalette остаётся null, build-дефолт подставится на уровне applyCustomPalette).
+function migrateAccentColorId(parsed) {
+	if (parsed.customPalette) return parsed.customPalette;
+	const legacyHue = LEGACY_ACCENT_HUES[parsed.accentColorId];
+	if (legacyHue === undefined) return null;
+	return { cNeutral: DEFAULT_CUSTOM_PALETTE.cNeutral, accentHue: nudgeHueOutOfForbiddenZones(legacyHue) };
+}
+
+// Глубокое слияние с дефолтом — старый/неполный payload (например, сохранённый до
+// добавления нового вложенного поля) не должен терять остальное дерево notifications.
+function mergeWithDefaults(parsed) {
+	const notifications = parsed.notifications ?? {};
+	return {
+		...DEFAULT_SETTINGS,
+		...parsed,
+		customPalette: migrateAccentColorId(parsed),
+		sendReadReceipts: parsed.sendReadReceipts !== false,
+		notifications: {
+			...DEFAULT_NOTIFICATIONS,
+			...notifications,
+			contacts: { ...DEFAULT_NOTIFICATIONS.contacts, ...(notifications.contacts ?? {}) },
+			messages: { ...DEFAULT_NOTIFICATIONS.messages, ...(notifications.messages ?? {}) },
+			channels: { ...DEFAULT_NOTIFICATIONS.channels, ...(notifications.channels ?? {}) },
+			moderation: { ...DEFAULT_NOTIFICATIONS.moderation, ...(notifications.moderation ?? {}) },
+		},
+	};
+}
+
+export function buildUiSettingsEvent(privKey, settings, createdAt = Math.floor(Date.now() / 1000)) {
+	const ownPubHex = bytesToHex(getPublicKey(privKey));
+	const content = nip44Encrypt(JSON.stringify(settings), privKey, ownPubHex);
+	return sign({ kind: KIND_UI_SETTINGS, content, tags: [["d", "settings"]], created_at: createdAt }, privKey);
+}
+
+export function parseUiSettingsEvent(event, privKey) {
+	const ownPubHex = bytesToHex(getPublicKey(privKey));
+	const plaintext = nip44Decrypt(event.content, privKey, event.pubkey || ownPubHex);
+	return mergeWithDefaults(JSON.parse(plaintext));
+}
+
+// НАЙДЕНО РАССУЖДЕНИЕМ (бутстрап-проблема) — активный relay нужен ДО того, как можно
+// что-либо получить С relay (включая сам этот kind 30072). Локальная запись —
+// единственный источник истины для ТЕКУЩЕГО подключения; при её отсутствии (первый
+// запуск) — build-time дефолт, который тут же станет локальной записью при первом save.
+export async function loadUiSettings(ownerPubkey, dbKey) {
+	const row = fromEncryptedRow(await db.table("uiSettings").get(ownerPubkey), dbKey);
+	if (!row) {
+		// Этап 64 — первый запуск ДЛЯ ЭТОГО pubkey на этом устройстве: язык
+		// интерфейса определяется системным языком, а не жёстко зашитым "ru"
+		// (DEFAULT_SETTINGS.language) — тот же принцип, что relayUrls/
+		// blossomUrls уже получают build-time дефолт именно в этой ветке.
+		const boot = readBootstrapEndpoints();
+		const relayUrls = boot.relayUrl
+			? [{ url: boot.relayUrl, read: true, write: true }]
+			: BUILD_DEFAULT_RELAYS.map((url) => ({ url, read: true, write: true }));
+		const blossomUrls = boot.blossomUrl ? [boot.blossomUrl] : getBuildBlossomServers();
+		const first = mergeWithDefaults({
+			language: detectSystemLocale(),
+			relayUrls,
+			blossomUrls,
+			activeBlossomUrl: blossomUrls[0] ?? null,
+		});
+		registerUserServers({ activeUrl: first.activeBlossomUrl, urls: first.blossomUrls });
+		return first;
+	}
+	const { ownerPubkey: _drop, ...settings } = row;
+	const merged = mergeWithDefaults(settings);
+	// НАЙДЕНО ЖИВЬЁМ (владелец, Э3 native, 2026-09-27) — тот же класс проблемы,
+	// что readBootstrapEndpoints уже решает для relay (см. её isLoopbackHost-
+	// проверку): активный Blossom-сервер, сохранённый ПРИ ПЕРВОМ ЗАПУСКЕ (когда
+	// config.json ещё указывал на локальный тестовый адрес), застревал в
+	// uiSettings навсегда — правка config.json на реальный адрес острова после
+	// этого ничего не меняла для уже существующих личностей на этом устройстве.
+	// Срабатывает только когда И активный адрес, И весь список — loopback (не
+	// трогает случай, где пользователь сам добавил настоящий сервер рядом).
+	if (isLoopbackHost(merged.activeBlossomUrl) && merged.blossomUrls.every(isLoopbackHost)) {
+		const boot = readBootstrapEndpoints();
+		if (boot.blossomUrl && !isLoopbackHost(boot.blossomUrl)) {
+			merged.blossomUrls = [boot.blossomUrl];
+			merged.activeBlossomUrl = boot.blossomUrl;
+		}
+	}
+	// НАЙДЕНО ЖИВЬЁМ (владелец, Э3 native, 2026-09-27) — тот же баг, что
+	// Blossom выше, только для relay: transport.js's connect() берёт
+	// relayEntries = localSettings.relayUrls НАПРЯМУЮ и переключается на
+	// bootstrap-дефолт ТОЛЬКО когда список пуст (relayEntries.length === 0) —
+	// непустой список из ОДНОГО loopback-адреса (личность создана на дев-
+	// конфиге) проходит эту проверку и используется как есть. connState
+	// повисает на "connecting" навсегда (WebSocket на 127.0.0.1 в нативной
+	// оболочке блокируется CSP), хотя config.json давно указывает на
+	// настоящий остров. Тот же принцип защиты, что и для Blossom.
+	if (merged.relayUrls.length > 0 && merged.relayUrls.every((r) => isLoopbackHost(r.url))) {
+		const boot = readBootstrapEndpoints();
+		if (boot.relayUrl && !isLoopbackHost(boot.relayUrl)) {
+			merged.relayUrls = [{ url: boot.relayUrl, read: true, write: true }];
+		}
+	}
+	registerTrustedImageOrigins(merged.blossomUrls);
+	registerUserServers({ activeUrl: merged.activeBlossomUrl, urls: merged.blossomUrls });
+	return merged;
+}
+
+// Этап 61 — прямая проверка "есть ли локальная запись НА ЭТОМ устройстве".
+// loadUiSettings намеренно неотличима снаружи (фолбэк смёрджен с дефолтом
+// точно так же, как настоящая запись) — bootstrap-обнаружение (transport.js)
+// должно знать именно это: "первый вход для этого pubkey на этом устройстве"
+// vs "уже была локальная история", а не "какие в итоге получились settings".
+export async function hasLocalUiSettings(ownerPubkey) {
+	return (await db.table("uiSettings").get(ownerPubkey)) !== undefined;
+}
+
+// Локально — сразу (офлайн-first), публикация — best-effort и НЕ бросает наружу
+// (тот же принцип, что profile.jsx: локальное сохранение не зависит от публикации).
+// dbKey (этап 45, Tier 4) — только для ЛОКАЛЬНОГО кэша на этом устройстве; kind 30072
+// остаётся NIP-44-шифрованным для синхронизации между СВОИМИ устройствами — два разных
+// шифра, не путать.
+export async function saveUiSettings(ownerPubkey, privKey, dbKey, settings, publish) {
+	await db.table("uiSettings").put(toEncryptedRow({ ownerPubkey, ...settings }, UI_SETTINGS_PLAINTEXT_FIELDS, dbKey));
+	registerTrustedImageOrigins(settings.blossomUrls);
+	registerUserServers({ activeUrl: settings.activeBlossomUrl, urls: settings.blossomUrls });
+	try {
+		// AUDIT-EGOROD A2: через постоянный outbox — настройки (включая список relay)
+		// доедут до других устройств и после оффлайна/закрытой вкладки.
+		await publishDurably(buildUiSettingsEvent(privKey, settings), publish, dbKey);
+	} catch {
+		// локально уже сохранено; outbox/сеть недоступны — не критичный путь.
+	}
+}
+
+// Вынесено из rebuildUiSettings (см. ниже) — тот же приём, что identity/profile.js's
+// hydrateOwnProfile отдельно от его bootstrap-обёртки: применение готового набора
+// kind:30072-событий не обязано знать, ОТКУДА они взялись (широкий bootstrap-скан
+// локального кэша ИЛИ прицельный oneShotRequest напрямую на relay, transport.js —
+// см. "Этап 71-довесок" там же). Возвращает true, если что-то реально применили.
+export async function applyUiSettingsEvents(ownerPubkey, privKey, dbKey, events) {
+	if (events.length === 0) return false;
+	const settings = parseUiSettingsEvent(pickLatest(events), privKey);
+	await db.table("uiSettings").put(toEncryptedRow({ ownerPubkey, ...settings }, UI_SETTINGS_PLAINTEXT_FIELDS, dbKey));
+	return true;
+}
+
+// Тот же паттерн, что rebuildContactsAndGroups (handlers.js, этап 20-24) — событие уже
+// приходит через существующий bootstrap-фильтр {authors:[я]}, нового REQ не нужно.
+export async function rebuildUiSettings(ownerPubkey, privKey, dbKey) {
+	const events = await db.table("events").where("[pubkey+kind]").equals([ownerPubkey, KIND_UI_SETTINGS]).toArray();
+	await applyUiSettingsEvents(ownerPubkey, privKey, dbKey, events);
+}
+
+// Этап 58 — мультирелейный транспорт: relayUrls теперь {url,read,write}[],
+// "одно активное" соединение не имеет смысла при одновременной работе с
+// несколькими (см. CONTRACTS.md/DESIGN.md, этап 58).
+// Этап 59 — сверх локального сохранения+приватной синхронизации (kind 30072,
+// уже делает saveUiSettings) каждая мутация ДОПОЛНИТЕЛЬНО публикует РЕАЛЬНЫЙ
+// kind:10002 (NIP-65) — единственный способ для ДРУГИХ участников/bootstrap-
+// координатора узнать relay-список по pubkey, не имея приватного ключа для
+// расшифровки kind 30072 (см. CONTRACTS.md, этап 59). Best-effort — тот же
+// принцип, что публикация kind 30072 внутри saveUiSettings: сеть недоступна
+// -> локальное состояние всё равно уже сохранено.
+// Этап 60 — рядом с kind:10002 публикуется kind:10050 (NIP-17, "DM Relay
+// List") со списком read-relay ("сюда мне присылайте" — read-сторона
+// получателя; write-only relay сюда не входят, на них нечего слушать).
+async function publishRelayList(privKey, relayUrls, publish) {
+	try {
+		await publish(buildRelayListEvent(privKey, relayUrls));
+	} catch {
+		// relay недоступен/отклонил — kind:10002 не критичен для локальной работы
+	}
+	try {
+		await publish(buildDmRelayListEvent(privKey, relayUrls.filter((r) => r.read).map((r) => r.url)));
+	} catch {
+		// то же — kind:10050 best-effort
+	}
+}
+
+export async function addRelayUrl(ownerPubkey, privKey, dbKey, url, publish) {
+	const settings = await loadUiSettings(ownerPubkey, dbKey);
+	if (settings.relayUrls.some((r) => r.url === url)) return; // идемпотентно
+	const nextRelayUrls = [...settings.relayUrls, { url, read: true, write: true }];
+	await saveUiSettings(ownerPubkey, privKey, dbKey, { ...settings, relayUrls: nextRelayUrls }, publish);
+	await publishRelayList(privKey, nextRelayUrls, publish);
+}
+
+export async function removeRelayUrl(ownerPubkey, privKey, dbKey, url, publish) {
+	const settings = await loadUiSettings(ownerPubkey, dbKey);
+	if (settings.relayUrls.length <= 1) {
+		throw new DomainError("нельзя удалить последний relay — список не может быть пустым", "errors.lastRelayCannotBeRemoved");
+	}
+	const nextRelayUrls = settings.relayUrls.filter((r) => r.url !== url);
+	await saveUiSettings(ownerPubkey, privKey, dbKey, { ...settings, relayUrls: nextRelayUrls }, publish);
+	await publishRelayList(privKey, nextRelayUrls, publish);
+}
+
+export async function setRelayRole(ownerPubkey, privKey, dbKey, url, { read, write }, publish) {
+	const settings = await loadUiSettings(ownerPubkey, dbKey);
+	if (!settings.relayUrls.some((r) => r.url === url)) {
+		throw new DomainError("URL отсутствует в списке — сначала добавьте", "errors.urlNotInList");
+	}
+	const nextRelayUrls = settings.relayUrls.map((r) => (r.url === url ? { url, read, write } : r));
+	if (!nextRelayUrls.some((r) => r.read)) {
+		throw new DomainError("нельзя оставить список без единого read-relay — нечего будет читать", "errors.noReadRelay");
+	}
+	if (!nextRelayUrls.some((r) => r.write)) {
+		throw new DomainError("нельзя оставить список без единого write-relay — нечего будет публиковать", "errors.noWriteRelay");
+	}
+	await saveUiSettings(ownerPubkey, privKey, dbKey, { ...settings, relayUrls: nextRelayUrls }, publish);
+	await publishRelayList(privKey, nextRelayUrls, publish);
+}
+
+export async function addBlossomUrl(ownerPubkey, privKey, dbKey, url, publish) {
+	const settings = await loadUiSettings(ownerPubkey, dbKey);
+	if (settings.blossomUrls.includes(url)) return;
+	await saveUiSettings(ownerPubkey, privKey, dbKey, { ...settings, blossomUrls: [...settings.blossomUrls, url] }, publish);
+}
+
+export async function removeBlossomUrl(ownerPubkey, privKey, dbKey, url, publish) {
+	const settings = await loadUiSettings(ownerPubkey, dbKey);
+	if (url === settings.activeBlossomUrl) {
+		throw new DomainError("нельзя удалить активный Blossom-сервер — сначала переключитесь на другой", "errors.cannotRemoveActiveBlossom");
+	}
+	await saveUiSettings(ownerPubkey, privKey, dbKey, { ...settings, blossomUrls: settings.blossomUrls.filter((u) => u !== url) }, publish);
+}
+
+export async function setActiveBlossomUrl(ownerPubkey, privKey, dbKey, url, publish) {
+	const settings = await loadUiSettings(ownerPubkey, dbKey);
+	if (!settings.blossomUrls.includes(url)) {
+		throw new DomainError("URL отсутствует в списке — сначала добавьте", "errors.urlNotInList");
+	}
+	await saveUiSettings(ownerPubkey, privKey, dbKey, { ...settings, activeBlossomUrl: url }, publish);
+}
+
+// Этап 63, И3 — TOFU (trust-on-first-use): если для ЭТОГО ЖЕ host:port уже
+// есть сопряжение с ДРУГИМ отпечатком сертификата, это подозрительно (сервер
+// подменили, или пользователь ошибся кодом) — по умолчанию отказ, вызывающая
+// сторона (UI) обязана явно передать force:true после подтверждения
+// пользователем, тот же принцип, что необратимые действия в chat.jsx
+// (window.confirm перед реальным действием).
+export class SelfHostedFingerprintMismatchError extends Error {
+	constructor(previousFingerprint, newFingerprint) {
+		super("отпечаток сервера отличается от сохранённого ранее для этого адреса — возможно, сервер подменили");
+		this.name = "SelfHostedFingerprintMismatchError";
+		this.previousFingerprint = previousFingerprint;
+		this.newFingerprint = newFingerprint;
+		this.key = "errors.selfHostedFingerprintMismatch";
+	}
+}
+
+export async function pairSelfHostedServer(ownerPubkey, privKey, dbKey, pairing, publish, { force = false } = {}) {
+	const settings = await loadUiSettings(ownerPubkey, dbKey);
+	const existing = settings.selfHostedServer;
+	if (
+		!force &&
+		existing &&
+		existing.host === pairing.host &&
+		existing.port === pairing.port &&
+		existing.fingerprint !== pairing.fingerprint
+	) {
+		throw new SelfHostedFingerprintMismatchError(existing.fingerprint, pairing.fingerprint);
+	}
+	const selfHostedServer = { ...pairing, pairedAt: Math.floor(Date.now() / 1000) };
+	await saveUiSettings(ownerPubkey, privKey, dbKey, { ...settings, selfHostedServer }, publish);
+}
+
+export async function unpairSelfHostedServer(ownerPubkey, privKey, dbKey, publish) {
+	const settings = await loadUiSettings(ownerPubkey, dbKey);
+	await saveUiSettings(ownerPubkey, privKey, dbKey, { ...settings, selfHostedServer: null }, publish);
+}
+
+// Редизайн интерфейса, этап 4 (CONTRACTS.md) — вызывается UI (channel.jsx's
+// handleSetDue), НЕ post.js: setPostDue (этап 1) намеренно без
+// privKey/publish, менять эту сигнатуру нельзя без отдельного решения с
+// полной регрессией (skill, правило 13). Идемпотентно — уже true, значит
+// сохранять/публиковать нечего, не спамим relay на каждую установку срока.
+export async function markDueDateEverSet(ownerPubkey, privKey, dbKey, publish) {
+	const settings = await loadUiSettings(ownerPubkey, dbKey);
+	if (settings.everSetDueDate) return;
+	await saveUiSettings(ownerPubkey, privKey, dbKey, { ...settings, everSetDueDate: true }, publish);
+}

@@ -1,0 +1,160 @@
+ugolok.tech, www.ugolok.tech {
+	encode gzip
+	# Этап 6 (TZ-cicd-hardening) — публичный эндпоинт временных TURN-кредов,
+	# turncreds-server слушает только localhost. Тот же origin — CORS у
+	# самого сервиса упрощается до необязательного (см. agent/cmd/turncreds-server).
+	# handle — не порядок в файле, а встроенный порядок директив Caddy; голый
+	# try_files ВНЕ handle выполнился бы раньше и переписал путь до того, как
+	# этот matcher успел бы сработать. Несколько handle-блоков в одном сервере
+	# — единственный способ получить взаимоисключающий порядок "как написано".
+	handle /api/turn-credentials {
+		reverse_proxy 127.0.0.1:8090
+	}
+	handle {
+		root * /var/www/ugolok
+		file_server
+		try_files {path} /index.html
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Strict-Transport-Security "max-age=31536000"
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options DENY
+	}
+	header /service-worker.js Cache-Control "no-cache"
+	header / Cache-Control "no-cache"
+	header /index.html Cache-Control "no-cache"
+	header /config.json Cache-Control "no-cache"
+	header /api/turn-credentials Cache-Control "no-store"
+	# SEO-BRAND-TZ.md, проверка п.2 — .webmanifest не входит во встроенную
+	# таблицу MIME Caddy (file_server отдавал бы его вовсе без Content-Type).
+	header /site.webmanifest Content-Type "application/manifest+json"
+}
+
+git.ugolok.tech {
+	encode gzip
+	reverse_proxy 127.0.0.1:3000 {
+		transport http {
+			read_timeout 3600s
+			write_timeout 3600s
+		}
+	}
+	request_body {
+		max_size 512MB
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Strict-Transport-Security "max-age=31536000"
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options DENY
+	}
+}
+
+relay.ugolok.tech {
+	# Firefox: WS не живёт на HTTP/3 (Alt-Svc h3) и часто ломается на h2 CONNECT.
+	tls {
+		alpn http/1.1
+	}
+	# Э-PUSH П1.1/П1.3 — «тот же домен, что relay», путь /push/…, чтобы не
+	# светить отдельный порт. Порядок handle-блоков — тот же приём, что
+	# /api/turn-credentials выше по файлу и @blob в blossom.ugolok.tech: явный
+	# путь ПЕРЕД общим врезается раньше, try_files/catch-all ниже не успевает
+	# сработать первым.
+	handle /push/register {
+		reverse_proxy 127.0.0.1:8091
+	}
+	handle_path /push/* {
+		reverse_proxy 127.0.0.1:2586
+	}
+	handle {
+		reverse_proxy 127.0.0.1:7777 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Real-IP {remote_host}
+			flush_interval -1
+			transport http {
+				versions 1.1
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+	header -Alt-Svc
+	header {
+		X-Content-Type-Options nosniff
+		Strict-Transport-Security "max-age=31536000"
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}
+
+blossom.ugolok.tech {
+	# gzip убран: тело — шифротекст (AEAD). PUT/DELETE только в Go (AUTH).
+	# GET/HEAD /{64hex}: файл с хоста (kernel Range/sendfile), иначе proxy
+	# на dual-read в Blossom. Регексп режет hash на {hh}/{hash}.
+	request_body {
+		max_size 512MB
+	}
+	@blob {
+		method GET HEAD
+		path_regexp blobhash ^/([0-9a-f]{2})([0-9a-f]{62})$
+	}
+	handle @blob {
+		@have file {
+			root /var/lib/ugolok/blossom
+			try_files /blobs/{re.blobhash.1}/{re.blobhash.1}{re.blobhash.2}
+		}
+		handle @have {
+			rewrite * /blobs/{re.blobhash.1}/{re.blobhash.1}{re.blobhash.2}
+			root * /var/lib/ugolok/blossom
+			header Cache-Control "public, max-age=31536000, immutable"
+			file_server
+		}
+		handle {
+			reverse_proxy 127.0.0.1:8000 {
+				flush_interval -1
+				transport http {
+					read_timeout 3600s
+					write_timeout 3600s
+				}
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8000 {
+			flush_interval -1
+			transport http {
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Strict-Transport-Security "max-age=31536000"
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options DENY
+	}
+	# AUDIT-EGOROD J1/G5: журнал нужен для разбора всплесков (видно, что и как часто
+	# качают/льют), но не как архив «кто что запрашивал»: адрес клиента обрезается
+	# до подсети (/24, /56), файл ротируется и живёт не дольше 3 суток. Без
+	# ротации он рос бы вечно (диск), а IP хранились бы бессрочно.
+	log {
+		output file /var/log/caddy/blossom-access.log {
+			roll_size 10MiB
+			roll_keep 5
+			roll_keep_for 72h
+		}
+		format filter {
+			wrap json
+			fields {
+				request>remote_ip ip_mask {
+					ipv4 24
+					ipv6 56
+				}
+				request>client_ip ip_mask {
+					ipv4 24
+					ipv6 56
+				}
+			}
+		}
+	}
+}
