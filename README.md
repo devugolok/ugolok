@@ -1,46 +1,72 @@
 # Уголок
 
-Замкнутый мессенджер на протоколе Nostr для локальной сети: свой relay, своё файловое хранилище. Это не клиент публичной сети Nostr.
+**Уютный мессенджер на протоколе Nostr, который живёт на вашем сервере.**
+Личные чаты со сквозным шифрованием, каналы, файлы и звонки. Без номера телефона, без одной главной компании и одного главного сервера.
 
-Клиент — два файла: `index.html` и `service-worker.js`.
+Попробовать: **<https://ugolok.tech>** — открывается в браузере, ставится на телефон или компьютер как приложение (PWA). Справка: [ugolok.tech/help](https://ugolok.tech/help/ru/o-proekte.html).
 
-## Требования
+## Зачем это
 
-Node ≥ 22.
+- **Сервис нельзя просто взять и отключить.** Аккаунт — это пара криптографических ключей, а не пароль в чьей-то базе. Если сервер заблокируют или он перестанет работать, можно перейти на другой, ничего не потеряв.
+- **Переписка зашифрована** так, что даже владелец сервера, через который идут сообщения, не может её прочитать.
+- **Можно поднять свой сервер** и не зависеть даже от серверов проекта.
 
-## Быстрый старт
+## Что умеет
+
+- Личные сообщения со сквозным шифрованием (MLS) и защитой от чтения задним числом (forward secrecy).
+- Каналы — что-то среднее между постом в соцсети и групповым чатом, с настройкой того, кто читает и комментирует.
+- Файлы и вложения в собственном шифрованном хранилище: сервер хранит только шифротекст.
+- Голосовые звонки.
+- **Быстрая связь** — временная комната для текста и голоса без регистрации; исчезает, когда все вышли.
+- Поиск по всей истории: контакты, сообщения, посты, комментарии.
+- Интерфейс на 12 языках.
+
+## Как устроено
+
+| Часть | Что внутри |
+|---|---|
+| Клиент | Preact + signals, Dexie (IndexedDB, локальная база зашифрована), `@noble/*`, MLS — `ts-mls`. Собирается Vite в один файл: `index.html` + `service-worker.js` |
+| Сообщения | Nostr-relay [strfry](https://github.com/hoytech/strfry) |
+| Файлы | [Blossom](https://github.com/hzrd149/blossom) — хранилище, привязанное к тем же ключам Nostr |
+| Звонки | WebRTC, свой TURN (coturn) с временными учётными данными |
+
+Подробнее — в справке: [технологии](https://ugolok.tech/help/ru/stek.html), [что защищено, а что нет](https://ugolok.tech/help/ru/privatnost.html).
+
+## Свой сервер
+
+- **VPS (Ubuntu/Debian, amd64):** из чекаута репозитория — `./agent/install.sh`. Ставит Docker и Go, собирает relay, Blossom и агент управления, запускает всё через systemd. Спросит домены и внешний IP (или возьмёт из переменных `RELAY_DOMAIN`, `BLOSSOM_DOMAIN`, `TURN_EXTERNAL_IP`).
+- **Локальная сеть (macOS/Linux):** [`docs/self-hosting.md`](docs/self-hosting.md) — relay и хранилище на машине в вашей сети, 15–20 минут.
+- Настройка клиента под свой инстанс: [`docs/config.md`](docs/config.md).
+
+## Разработка
+
+Нужен Node ≥ 22.
 
 ```bash
 git clone https://github.com/devugolok/ugolok.git
 cd ugolok
 npm ci
-npm run dev
+npm run dev              # http://localhost:5173
 ```
-
-Откройте http://localhost:5173
-
-## Тесты и сборка
 
 ```bash
-npm test                 # tests/*.test.js и tests/harness/*.test.js (fake-relay, ws-bridge)
-npm run build            # dist/index.html + dist/service-worker.js
-./scripts/ci-check.sh    # ci + test + build + лимит размера
+npm test                 # tests/*.test.js и tests/harness/*.test.js
+npm run build            # dist/index.html + dist/service-worker.js (+ страницы справки)
+./scripts/ci-check.sh    # установка, тесты, сборка, лимит размера бандла
 ```
 
-## Инфраструктура
+Дальше: [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/RUNBOOK.md`](docs/RUNBOOK.md), поставка и релизы — [`docs/delivery.md`](docs/delivery.md), проверка сборки — [`docs/verify.md`](docs/verify.md).
 
-| Путь | Роль сейчас |
-|---|---|
-| `server/*/setup.sh` + `run.sh` | главный LAN-путь на Mini |
-| `agent/compose/` | Docker-бандл своего инстанса (инсталлятор) |
-| `deploy/compose.yml` | скелет будущего VPS, не замена двум верхним |
+## Статус
 
-- Свой сервер в LAN: [`docs/self-hosting.md`](docs/self-hosting.md)
-- Инсталлятор инстанса: каталог [`agent/`](agent/)
-- Поставка и релизы: [`docs/delivery.md`](docs/delivery.md)
-- Проверка сборки: [`docs/verify.md`](docs/verify.md)
-- Как устроен git и CI: [`docs/RUNBOOK.md`](docs/RUNBOOK.md), [`CONTRIBUTING.md`](CONTRIBUTING.md)
+Проект молодой и активно меняется. Сборки под Android и десктоп собираются на каждом релизе, но публичной страницы загрузок пока нет — пользуйтесь веб-версией.
 
-## Чего здесь нет
+Этот репозиторий — публичное зеркало: код публикуется сюда из рабочего репозитория, без истории коммитов.
 
-Публичный интернет из коробки, магазин приложений, Capacitor/Electron. Origin пользователя — ваш хост в локальной сети (позже свой домен), не чужой relay.
+## Связь
+
+Вопросы, ошибки и идеи — в [Issues](https://github.com/devugolok/ugolok/issues) или на **support@ugolok.tech**. Никогда не присылайте секретную фразу, пароль или приватный ключ (`nsec…`).
+
+## Лицензия
+
+[ISC](LICENSE).

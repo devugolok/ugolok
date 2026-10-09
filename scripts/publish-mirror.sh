@@ -20,8 +20,10 @@ set -euo pipefail
 REF="${1:-main}"
 MIRROR_URLS="${MIRROR_URLS:-git@github.com:devugolok/ugolok.git}"
 MIRROR_SSH_KEY="${MIRROR_SSH_KEY:-$HOME/.ssh/ugolok_mirror_ed25519}"
-# PROCESS-DOCS — служебные заметки разработки (см. docs/RUNBOOK.md), не витрина.
-MIRROR_EXCLUDE="${MIRROR_EXCLUDE:-PROCESS-DOCS}"
+# Не витрина: PROCESS-DOCS — служебные заметки разработки (docs/RUNBOOK.md);
+# FEATURE-SPECS, FILES-DOCS — внутренние спеки фич; ASSETS-SOURCE — исходники
+# дизайна и звуков. Код от них не зависит (только упоминания в комментариях).
+MIRROR_EXCLUDE="${MIRROR_EXCLUDE:-PROCESS-DOCS FEATURE-SPECS FILES-DOCS ASSETS-SOURCE}"
 NAME="Ugolok"
 EMAIL="dev@ugolok.tech"
 

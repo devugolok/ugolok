@@ -142,7 +142,7 @@ git checkout main
 
 ## 10. Публичное зеркало
 
-Открытый код для всех — <https://github.com/devugolok/ugolok>. Это **зеркало без истории**: `scripts/publish-mirror.sh [ref]` берёт дерево `main` (без `PROCESS-DOCS/`) и кладёт его в зеркало одним новым коммитом от `Ugolok <dev@ugolok.tech>` с датой в UTC. История рабочего репозитория наружу не уходит.
+Открытый код для всех — <https://github.com/devugolok/ugolok>. Это **зеркало без истории**: `scripts/publish-mirror.sh [ref]` берёт дерево `main` (без внутренних `PROCESS-DOCS/`, `FEATURE-SPECS/`, `FILES-DOCS/`, `ASSETS-SOURCE/`) и кладёт его в зеркало одним новым коммитом от `Ugolok <dev@ugolok.tech>` с датой в UTC. История рабочего репозитория наружу не уходит.
 
 Пушит скрипт отдельным SSH-ключом зеркала (`~/.ssh/ugolok_mirror_ed25519`, deploy key с правом записи только в этот репозиторий), не личным ключом. Без изменений в дереве новый коммит не создаётся. Пробный прогон: `MIRROR_DRY_RUN=1 scripts/publish-mirror.sh`.
 
